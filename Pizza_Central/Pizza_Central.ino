@@ -90,6 +90,26 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       sendDeliverResult(1, true, 0);
     }
   }
+  if (hdr.type == HELLO && len >= sizeof(HelloPayload)) {
+    const HelloPayload* h = (const HelloPayload*)payload;
+    char macbuf[18];
+    snprintf(macbuf, sizeof(macbuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+            h->mac[0],h->mac[1],h->mac[2],h->mac[3],h->mac[4],h->mac[5]);
+    PZ_LOGI("HELLO role=%u id=%u fw=%s mac=%s", hdr.role, hdr.house_id, h->fw, macbuf);
+    return;
+  }
+
+  if (hdr.type == OTA_ACK && len >= sizeof(OtaAckPayload)) {
+    const OtaAckPayload* a = (const OtaAckPayload*)payload;
+    PZ_LOGI("OTA_ACK from role=%u id=%u accept=%u code=%u", hdr.role, hdr.house_id, a->accept, a->code);
+    return;
+  }
+
+  if (hdr.type == OTA_RESULT && len >= sizeof(OtaResultPayload)) {
+    const OtaResultPayload* r = (const OtaResultPayload*)payload;
+    PZ_LOGI("OTA_RESULT from role=%u id=%u ok=%u code=%u", hdr.role, hdr.house_id, r->ok, r->code);
+    return;
+  }
 }
 
 static String readLine() {

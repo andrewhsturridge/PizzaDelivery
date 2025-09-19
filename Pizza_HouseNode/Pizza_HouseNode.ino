@@ -19,6 +19,7 @@
 #include "BuildConfig.h"
 #include "PizzaRfid.h"
 #include "PizzaAudio.h"
+#include "PizzaOta.h"
 
 static uint16_t g_seq = 1;
 Preferences prefs;
@@ -30,6 +31,11 @@ static const uint16_t LED_COUNT  = 90;
 static const uint8_t  RC522_CS   = 5;
 static const uint8_t  RC522_RST  = 11;
 static const uint8_t  SPI_SCK    = 36, SPI_MISO = 37, SPI_MOSI = 35;
+
+// --- OTA deferral ---
+static volatile bool g_otaPending = false;
+static char g_otaUrl[160] = {0};
+static char g_otaVer[12]  = {0};
 
 Adafruit_NeoPixel strip(LED_COUNT, PIN_WS2812, NEO_GRB + NEO_KHZ800);
 
@@ -114,6 +120,24 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     }
   }
 
+  if (hdr.type == OTA_START && len >= sizeof(OtaStartPayload)) {
+    const OtaStartPayload* p = (const OtaStartPayload*)payload;
+    if (!matchOtaTarget(p)) return;
+
+    // ACK quickly (still ok from callback)
+    OtaAckPayload ack{}; ack.accept = 1; ack.code = 0;
+    uint8_t out[64];
+    size_t n = PizzaProtocol::pack(OTA_ACK, (Role)PIZZA_ROLE, g_houseId, g_seq++, &ack, sizeof(ack), out, sizeof(out));
+    PizzaNow::sendBroadcast(out, n);
+
+    // Defer actual OTA to loop()
+    strlcpy(g_otaUrl, p->url, sizeof(g_otaUrl));
+    strlcpy(g_otaVer, p->ver, sizeof(g_otaVer));
+    g_otaPending = true;
+    PZ_LOGI("OTA queued: %s", g_otaUrl);
+    return;
+  }
+
 }
 
 static void cfgLoad() {
@@ -127,7 +151,14 @@ static void cfgSaveHouseId(uint8_t id) {
   prefs.putUChar("house_id", id);
   prefs.end();
   g_houseId = id;
-} 
+}
+
+static bool matchOtaTarget(const OtaStartPayload* p) {
+  if (p->target_role != (uint8_t)PIZZA_ROLE) return false;
+  if (p->scope == 0) return true; // ALL
+  for (uint8_t i=0; i<sizeof(p->ids); i++) if (p->ids[i] == g_houseId) return true;
+  return false;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -174,6 +205,27 @@ void setup() {
 
 void loop() {
   PizzaNow::loop();
+
+  if (g_otaPending) {
+    // take the job atomically
+    noInterrupts();
+    bool run = g_otaPending; g_otaPending = false;
+    interrupts();
+
+    if (run) {
+      // Quiet LEDs during update
+      strip.clear(); strip.show();
+
+      auto res = PizzaOta::start(g_otaUrl, g_otaVer, OTA_TOTAL_MS);
+      if (res != PizzaOta::OK) {
+        OtaResultPayload rr{}; rr.ok = 0; rr.code = (uint8_t)res;
+        uint8_t out[64];
+        size_t n = PizzaProtocol::pack(OTA_RESULT, (Role)PIZZA_ROLE, g_houseId, g_seq++, &rr, sizeof(rr), out, sizeof(out));
+        PizzaNow::sendBroadcast(out, n);
+      }
+      // success path reboots inside start()
+    }
+  }
 
   // Poll RFID ~10 Hz
   static uint32_t nextPoll = 0;
