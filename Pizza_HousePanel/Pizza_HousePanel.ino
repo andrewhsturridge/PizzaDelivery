@@ -24,6 +24,8 @@ static volatile bool g_otaPending = false;
 static char g_otaUrl[160] = {0};
 static char g_otaVer[12]  = {0};
 
+static bool g_inOta = false;
+
 static void cfgLoad() {
   prefs.begin("pizza", false);
   g_houseId = prefs.getUChar("house_id", 0);
@@ -55,7 +57,7 @@ static void showStatus() {
     PizzaPanel::showText("UNCLAIMED - RUN claim", /*style*/1, /*speed*/1, /*bright*/120);
   } else {
     char msg[32];
-    snprintf(msg, sizeof(msg), "House %u ONLINE", (unsigned)g_houseId);
+    snprintf(msg, sizeof(msg), "House %u", (unsigned)g_houseId);
     PizzaPanel::showText(msg, /*style*/1, /*speed*/1, /*bright*/120);
   }
 }
@@ -67,11 +69,32 @@ static bool matchOtaTarget(const OtaStartPayload* p) {
   return false;
 }
 
+static void panelOtaBottomBar(size_t written, size_t total) {
+  // PizzaOta calls s_cb(1,1) right before reboot on success → treat as 100%
+  uint8_t pct;
+  if (total == 1 && written == 1) {
+    pct = 100;
+  } else if (total > 0) {
+    pct = (uint8_t)((written * 100ULL) / total);
+  } else {
+    // Unknown size: we don't update mid-download; just show 0% at start
+    return;
+  }
+
+  // Snap to 20% milestones (0,20,40,60,80,100)
+  static uint8_t lastStep = 255;
+  uint8_t step = pct / 20;             // 0..5
+  if (step == lastStep) return;
+  lastStep = step;
+
+  PizzaPanel::showBottomBarPercent(step * 20);
+}
+
 // --- RX handler ---
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t /*srcMac*/[6]) {
   if (hdr.type == HELLO_REQ) { sendHello(); return; }
 
-  if (hdr.type == PANEL_TEXT && len >= sizeof(PanelTextPayload)) {
+  if (hdr.type == PANEL_TEXT && !g_inOta && len >= sizeof(PanelTextPayload)) {
     const PanelTextPayload* p = (const PanelTextPayload*)payload;
     if (p->house_id == g_houseId) {
       PZ_LOGI("PANEL_TEXT: id=%u \"%s\" style=%u speed=%u bright=%u",
@@ -126,6 +149,8 @@ void setup() {
   }
   showStatus(); // "UNCLAIMED" or "House N ONLINE"
 
+  PizzaOta::setProgressCallback(panelOtaBottomBar);
+
   // Radio
   if (!PizzaNow::begin(ESPNOW_CHANNEL)) {
     PZ_LOGE("ESPNOW init failed");
@@ -138,24 +163,30 @@ void setup() {
 
 void loop() {
   PizzaNow::loop();
-  PizzaPanel::loop(); // animates scroll if style==0
+
+  if (!g_inOta) {
+    PizzaPanel::loop();                  // will early-return unless style==0
+  }
 
   if (g_otaPending) {
-    noInterrupts();
-    bool run = g_otaPending; g_otaPending = false;
-    interrupts();
-
+    noInterrupts(); bool run = g_otaPending; g_otaPending = false; interrupts();
     if (run) {
-      PizzaPanel::showText("UPDATING...", 1, 1, 120);
+      g_inOta = true;
+
+      // Start with a clean row & 0% bar, then do OTA
+      PizzaPanel::progressBarReset();
+      PizzaPanel::showBottomBarPercent(0);
+
       auto res = PizzaOta::start(g_otaUrl, g_otaVer, OTA_TOTAL_MS);
+
       if (res != PizzaOta::OK) {
         OtaResultPayload rr{}; rr.ok = 0; rr.code = (uint8_t)res;
         uint8_t out[64];
         size_t n = PizzaProtocol::pack(OTA_RESULT, (Role)PIZZA_ROLE, g_houseId, g_seq++, &rr, sizeof(rr), out, sizeof(out));
         PizzaNow::sendBroadcast(out, n);
-        PizzaPanel::showText("OTA FAIL", 1, 1, 120);
+        PizzaPanel::showText("OTA FAIL", 1, 1, 120);  // one static frame after OTA ends
       }
+      g_inOta = false; // won't run if we rebooted on success
     }
   }
-
 }

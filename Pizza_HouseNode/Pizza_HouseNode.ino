@@ -160,6 +160,33 @@ static bool matchOtaTarget(const OtaStartPayload* p) {
   return false;
 }
 
+// Progress -> LED bar fill
+static void nodeOtaProgress(size_t written, size_t total) {
+  static uint8_t lastPct = 255;
+  uint8_t pct = 0;
+  if (total > 0) {
+    pct = (uint8_t)((written * 100ULL) / total);
+  } else {
+    static uint8_t s=0; s = (s + 3) % 100; pct = s; // spinner
+  }
+  if (pct == lastPct) return;
+  lastPct = pct;
+
+  // map to pixels
+  uint16_t lit = (uint16_t)((pct * (uint32_t)LED_COUNT) / 100);
+  for (uint16_t i=0; i<LED_COUNT; i++) {
+    // yellow-ish progress color
+    strip.setPixelColor(i, (i < lit) ? strip.Color(80,80,0) : 0);
+  }
+  strip.show();
+
+  // brief all-green at 100% (will show ~250ms before reboot)
+  if (pct == 100) {
+    for (uint16_t i=0; i<LED_COUNT; i++) strip.setPixelColor(i, strip.Color(0,80,0));
+    strip.show();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(250);  // let USB/serial settle
@@ -177,6 +204,8 @@ void setup() {
     strip.show(); delay(150);
   }
   strip.clear(); strip.show();
+
+  PizzaOta::setProgressCallback(nodeOtaProgress);
 
   auto rr = esp_reset_reason();
   PZ_LOGI("HouseNode boot fw=%s mac=%s reset_reason=%d",
