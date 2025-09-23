@@ -185,6 +185,15 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     return;
   }
 
+  if (hdr.type == PIZZA_ING_UPDATE && len >= sizeof(PizzaIngrUpdatePayload)) {
+    const PizzaIngrUpdatePayload* u = (const PizzaIngrUpdatePayload*)payload;
+    PZ_LOGI("ING_UPDATE from id=%u mask=0x%02X (P=%d M=%d Pe=%d Pi=%d H=%d)",
+            hdr.house_id, u->mask,
+            !!(u->mask&1), !!(u->mask&2), !!(u->mask&4), !!(u->mask&8), !!(u->mask&16));
+    // TODO: store uid->mask in a small map so deliveries can be validated later.
+    return;
+  }
+
   if (hdr.type == OTA_ACK && len >= sizeof(OtaAckPayload)) {
     const OtaAckPayload* a = (const OtaAckPayload*)payload;
     PZ_LOGI("OTA_ACK from role=%u id=%u accept=%u code=%u", hdr.role, hdr.house_id, a->accept, a->code);
