@@ -25,6 +25,34 @@ struct TagEntry { uint8_t len; uint8_t uid[10]; uint8_t mask; uint32_t ts; };
 static TagEntry g_tags[32];
 static uint8_t  g_tagCount = 0;
 
+/*** CENTRAL: Orders storage ***/
+static PzOrderItemSetPayload g_orders[PZ_ORDERS_MAX];
+static uint8_t g_orderCount = 0;
+static uint16_t g_seq_orders = 1;
+
+static void ordersResetLocal() {
+  g_orderCount = 0;
+  for (uint8_t i=0;i<PZ_ORDERS_MAX;i++) {
+    g_orders[i].index = i;
+    g_orders[i].house_id = 0;
+    g_orders[i].mask = 0;
+    memset(g_orders[i].text, 0, sizeof(g_orders[i].text));
+  }
+}
+
+static bool ordersAddLocal(uint8_t house_id, uint8_t mask, const char* text) {
+  if (g_orderCount >= PZ_ORDERS_MAX) return false;
+  PzOrderItemSetPayload &it = g_orders[g_orderCount];
+  it.index = g_orderCount;
+  it.house_id = house_id;
+  it.mask = mask;
+  memset(it.text, 0, sizeof(it.text));
+  if (text && *text) strncpy(it.text, text, sizeof(it.text)-1);
+  g_orderCount++;
+  return true;
+}
+
+
 enum DeliverReason : uint8_t {
   DR_OK = 0,
   DR_UNKNOWN_PIZZA = 1,
@@ -185,6 +213,28 @@ static void sendIngrSnapshot(const PizzaIngrSnapshotPayload& sp) {
   size_t n = PizzaProtocol::pack(PIZZA_ING_SNAPSHOT, CENTRAL, 0, g_seq++, &sp, sizeof(sp), buf, sizeof(buf));
   PizzaNow::sendBroadcast(buf, n);
   PZ_LOGI("ING_SNAPSHOT ok=%u mask=0x%02X", sp.ok, sp.mask);
+}
+
+/*** CENTRAL: send RESET and ITEM_SET packets (broadcast) ***/
+static void ordersSendReset(uint8_t count) {
+  PzOrderListResetPayload p{ count };
+  uint8_t buf[64];
+  size_t n = PizzaProtocol::pack(ORDER_LIST_RESET, CENTRAL, 0, g_seq_orders++, &p, sizeof(p), buf, sizeof(buf));
+  PizzaNow::sendBroadcast(buf, n);
+  Serial.printf("[Central] ORDER_LIST_RESET count=%u\n", count);
+}
+
+static void ordersSendItem(const PzOrderItemSetPayload& item) {
+  uint8_t buf[256];
+  size_t n = PizzaProtocol::pack(ORDER_ITEM_SET, CENTRAL, 0, g_seq_orders++, &item, sizeof(item), buf, sizeof(buf));
+  PizzaNow::sendBroadcast(buf, n);
+  Serial.printf("[Central] ORDER_ITEM_SET idx=%u H%u mask=0x%02X\n", item.index, item.house_id, item.mask);
+}
+
+/*** CENTRAL: push local list to the Orders Node(s) ***/
+static void ordersPushAll() {
+  ordersSendReset(g_orderCount);
+  for (uint8_t i=0;i<g_orderCount;i++) ordersSendItem(g_orders[i]);
 }
 
 static Role parseRole(const String& s) {
@@ -495,6 +545,58 @@ void loop() {
       }
       Serial.print(F(" → ")); printMask(g_tags[i].mask); Serial.println();
     }
+    return;
+  }
+
+  /*** CENTRAL CLI: orders ... ***/
+  if (line.startsWith("orders ")) {
+    String rest = line.substring(7); rest.trim();
+
+    if (rest == "reset") { ordersResetLocal(); Serial.println("orders: reset"); return; }
+
+    if (rest == "show") {
+      Serial.printf("orders: count=%u\n", g_orderCount);
+      for (uint8_t i=0;i<g_orderCount;i++) {
+        Serial.printf("  [%u] H%u mask=0x%02X text=\"%s\"\n",
+          i, g_orders[i].house_id, g_orders[i].mask, g_orders[i].text);
+      }
+      return;
+    }
+
+    if (rest == "push") { ordersPushAll(); return; }
+
+    // orders add <house_id> <mask> "text..."
+    if (rest.startsWith("add ")) {
+      rest = rest.substring(4);
+      int sp = rest.indexOf(' ');
+      if (sp < 0) { Serial.println("usage: orders add <house_id> <mask> \"text\""); return; }
+      int house = rest.substring(0, sp).toInt();
+
+      String rest2 = rest.substring(sp+1); rest2.trim();
+      sp = rest2.indexOf(' ');
+      if (sp < 0) { Serial.println("usage: orders add <house_id> <mask> \"text\""); return; }
+
+      String maskStr = rest2.substring(0, sp);
+      String textStr = rest2.substring(sp+1); textStr.trim();
+      if (textStr.length() && textStr[0]=='\"' && textStr[textStr.length()-1]=='\"') {
+        textStr = textStr.substring(1, textStr.length()-1);
+      }
+
+      long mask = (maskStr.startsWith("0x")||maskStr.startsWith("0X")) ? strtol(maskStr.c_str(), nullptr, 16)
+                                                                      : maskStr.toInt();
+      if (house < 1 || house > 6 || mask < 0 || mask > 31) {
+        Serial.println("usage: orders add <house_id 1..6> <mask 0..31|0xNN> \"text\"");
+        return;
+      }
+      if (!ordersAddLocal((uint8_t)house, (uint8_t)mask, textStr.c_str())) {
+        Serial.println("orders: list full (max 6)");
+        return;
+      }
+      Serial.println("orders: added");
+      return;
+    }
+
+    Serial.println("orders commands: reset | show | add <house> <mask> \"text\" | push");
     return;
   }
 
