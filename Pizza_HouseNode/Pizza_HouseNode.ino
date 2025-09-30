@@ -47,6 +47,22 @@ enum Effect { EFFECT_NONE, EFFECT_OK_PULSE, EFFECT_ERR_PULSE, EFFECT_YELLOW_PING
 static Effect   g_fx      = EFFECT_NONE;
 static uint32_t g_fxUntil = 0;   // millis() deadline for one-shot effects
 
+/*** Delivery FSM (scan -> await result -> require removal) ***/
+enum HState : uint8_t { HS_IDLE=0, HS_WAIT_RESULT, HS_WAIT_REMOVAL };
+static HState  g_state = HS_IDLE;
+
+static bool    g_haveResult = false;
+static bool    g_lastOk = false;
+static uint8_t g_lastReason = 0;
+
+static uint8_t  g_lastUid[10];
+static uint8_t  g_lastLen = 0;
+
+static const uint32_t RESULT_TIMEOUT_MS = 1500;   // wait for Central
+static const uint32_t REMOVAL_STABLE_MS = 250;    // require stable absence
+static uint32_t g_stateDeadline = 0;
+static uint32_t g_absentSince  = 0;
+
 static void fillBeep() {
   const float freq = 1000.0f, sr = 22050.0f;
   for (size_t i=0; i<sizeof(beepBuf)/sizeof(beepBuf[0]); ++i) {
@@ -83,18 +99,24 @@ static void sendDeliverScan(const uint8_t* uid, uint8_t uidLen) {
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t /*srcMac*/[6]) {
   if (hdr.type == HELLO_REQ) { sendHello(); return; }
 
+  /*** onRx: delivery verdict from Central ***/
   if (hdr.type == DELIVER_RESULT && len >= sizeof(DeliverResultPayload)) {
     const DeliverResultPayload* r = (const DeliverResultPayload*)payload;
-    if (r->ok) {
-      g_fx = EFFECT_OK_PULSE;
-      g_fxUntil = millis() + 600;          // 600ms green pulse
-      PizzaAudio::playClip(beepBuf, sizeof(beepBuf)/2, 255);
-      PZ_LOGI("DELIVER_RESULT OK");
-    } else {
-      g_fx = EFFECT_ERR_PULSE;
-      g_fxUntil = millis() + 600;          // red pulse
-      PZ_LOGI("DELIVER_RESULT ERR reason=%u", r->reason);
+    if (hdr.house_id == g_houseId) { // only react if it’s for me
+      g_haveResult = true;
+      g_lastOk     = (r->ok != 0);
+      g_lastReason = r->reason;
+
+      if (g_lastOk) {
+        g_fx = EFFECT_OK_PULSE; g_fxUntil = millis() + 600;
+        PizzaAudio::playClip(beepBuf, sizeof(beepBuf)/2, 255);
+        PZ_LOGI("DELIVER_RESULT OK");
+      } else {
+        g_fx = EFFECT_ERR_PULSE; g_fxUntil = millis() + 600;
+        PZ_LOGI("DELIVER_RESULT ERR reason=%u", r->reason);
+      }
     }
+    return;
   }
 
   if (hdr.type == SOUND_PLAY && len >= sizeof(SoundPlayPayload)) {
@@ -256,19 +278,50 @@ void loop() {
     }
   }
 
-  // Poll RFID ~10 Hz
+  /*** Delivery FSM tick ***/
   static uint32_t nextPoll = 0;
   if ((int32_t)(millis() - nextPoll) >= 0) {
-    nextPoll = millis() + 100;
-    uint8_t uid[10]; uint8_t uidLen = 0;
-    if (PizzaRfid::readUid(uid, uidLen)) {
-      // rate-limit repeats of the same UID (2s)
-      static uint8_t lastUid[10]; static uint8_t lastLen=0; static uint32_t lastAt=0;
-      bool same = (uidLen == lastLen) && (memcmp(uid, lastUid, uidLen) == 0) && (millis() - lastAt < 2000);
-      if (!same) {
-        memcpy(lastUid, uid, uidLen); lastLen = uidLen; lastAt = millis();
-        sendDeliverScan(uid, uidLen);
-      }
+    nextPoll = millis() + 50; // ~20 Hz check; readUid() already gates on field presence
+
+    switch (g_state) {
+      case HS_IDLE: {
+        // Card present? Read UID once and send exactly one scan.
+        uint8_t uid[10]; uint8_t uidLen = 0;
+        if (PizzaRfid::readUid(uid, uidLen)) {
+          memcpy(g_lastUid, uid, uidLen); g_lastLen = uidLen;
+          sendDeliverScan(uid, uidLen);                       // existing helper
+          g_haveResult   = false;
+          g_state        = HS_WAIT_RESULT;
+          g_stateDeadline= millis() + RESULT_TIMEOUT_MS;
+        }
+      } break;
+
+      case HS_WAIT_RESULT: {
+        if (g_haveResult) {
+          // LEDs/audio were kicked in onRx; now enforce removal before next try
+          g_absentSince = 0;
+          g_state = HS_WAIT_REMOVAL;
+        } else if ((int32_t)(millis() - g_stateDeadline) >= 0) {
+          // Timeout behaves like a fail → require removal
+          g_lastOk = false; g_lastReason = 0xFE; // pseudo "timeout"
+          g_fx = EFFECT_ERR_PULSE; g_fxUntil = millis() + 600;
+          g_absentSince = 0;
+          g_state = HS_WAIT_REMOVAL;
+        }
+      } break;
+
+      case HS_WAIT_REMOVAL: {
+        // Stay here until no card for a short, stable window
+        uint8_t uid[10]; uint8_t uidLen = 0;
+        if (!PizzaRfid::readUid(uid, uidLen)) {
+          if (g_absentSince == 0) g_absentSince = millis();
+          if ((int32_t)(millis() - g_absentSince) >= (int32_t)REMOVAL_STABLE_MS) {
+            g_state = HS_IDLE; // re-arm
+          }
+        } else {
+          g_absentSince = 0; // still present
+        }
+      } break;
     }
   }
 

@@ -16,6 +16,67 @@
 
 static uint16_t g_seq = 1;
 
+/*** Block A: GLOBAL STATE + HELPERS ***/
+static const uint8_t MASK_NONE = 0xFF;      // "no order set"
+static uint8_t g_orderMask[256];            // house_id -> target mask
+
+// Small ring buffer of recent pizza tags we’ve seen (uid -> mask)
+struct TagEntry { uint8_t len; uint8_t uid[10]; uint8_t mask; uint32_t ts; };
+static TagEntry g_tags[32];
+static uint8_t  g_tagCount = 0;
+
+enum DeliverReason : uint8_t {
+  DR_OK = 0,
+  DR_UNKNOWN_PIZZA = 1,
+  DR_NO_ORDER = 2,
+  DR_WRONG_PIZZA = 3,
+};
+
+static void stateInit() {
+  for (int i = 0; i < 256; ++i) g_orderMask[i] = MASK_NONE;
+  g_tagCount = 0;
+}
+
+static int tagFind(const uint8_t* uid, uint8_t len) {
+  for (uint8_t i = 0; i < g_tagCount; ++i) {
+    if (g_tags[i].len == len && memcmp(g_tags[i].uid, uid, len) == 0) return i;
+  }
+  return -1;
+}
+
+static void tagUpsert(const uint8_t* uid, uint8_t len, uint8_t mask) {
+  int idx = tagFind(uid, len);
+  if (idx >= 0) {
+    g_tags[idx].mask = mask;
+    g_tags[idx].ts   = millis();
+    return;
+  }
+  if (g_tagCount < (uint8_t)(sizeof(g_tags)/sizeof(g_tags[0]))) {
+    idx = g_tagCount++;
+  } else {
+    // Evict oldest
+    uint8_t oldest = 0;
+    for (uint8_t i = 1; i < g_tagCount; ++i) if (g_tags[i].ts < g_tags[oldest].ts) oldest = i;
+    idx = oldest;
+  }
+  g_tags[idx].len  = len;
+  memcpy(g_tags[idx].uid, uid, len);
+  g_tags[idx].mask = mask;
+  g_tags[idx].ts   = millis();
+}
+
+static void printMask(uint8_t m) {
+  if (m == MASK_NONE) { Serial.print(F("(none)")); return; }
+  Serial.print(F("0x")); if (m < 16) Serial.print('0'); Serial.print(m, HEX);
+  Serial.print(F(" ["));
+  Serial.print((m &  1) ? 'P' : '.'); // Pepperoni
+  Serial.print((m &  2) ? 'M' : '.'); // Mushrooms
+  Serial.print((m &  4) ? 'p' : '.'); // Peppers
+  Serial.print((m &  8) ? 'i' : '.'); // Pineapple
+  Serial.print((m & 16) ? 'H' : '.'); // Ham
+  Serial.print(']');
+}
+
 // -------------------- ROSTER --------------------
 struct DeviceInfo {
   uint8_t  mac[6];
@@ -165,6 +226,15 @@ static void sendClaim(const uint8_t mac[6], uint8_t newId, bool force=false) {
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t srcMac[6]) {
   char macbuf[18]; macToStr(srcMac, macbuf);
 
+  /*** Block B: onRx – PIZZA_ING_UPDATE -> remember uid→mask ***/
+  if (hdr.type == PIZZA_ING_UPDATE && len >= sizeof(PizzaIngrUpdatePayload)) {
+    const PizzaIngrUpdatePayload* u = (const PizzaIngrUpdatePayload*)payload;
+    Serial.printf("[Central] ING_UPDATE from id=%u mask=0x%02X\n", hdr.house_id, u->mask);
+    // Payload is expected to provide u->uid (bytes), u->uid_len, u->mask
+    tagUpsert(u->uid, u->uid_len, u->mask);
+    return;
+  }
+
   if (hdr.type == HELLO && len >= sizeof(HelloPayload)) {
     const HelloPayload* h = (const HelloPayload*)payload;
     rosterUpdateFromHello(hdr, h, srcMac);
@@ -172,16 +242,20 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     return;
   }
 
+  /*** Block C: onRx – DELIVER_SCAN -> validate against order & cache ***/
   if (hdr.type == DELIVER_SCAN && len >= sizeof(DeliverScanPayload)) {
     const DeliverScanPayload* s = (const DeliverScanPayload*)payload;
-    PZ_LOGI("SCAN mac=%s house=%u uidLen=%u", macbuf, s->house_id, s->uid_len);
+    // Payload is expected to provide s->house_id, s->uid (bytes), s->uid_len
+    uint8_t reason = DR_OK;
+    uint8_t order  = g_orderMask[s->house_id];
+    int idx = tagFind(s->uid, s->uid_len);
 
-    // TODO: real validation later. For now: always OK.
-    sendDeliverResult(s->house_id, /*ok*/true, /*reason*/0);
+    if (idx < 0)                    reason = DR_UNKNOWN_PIZZA; // never saw this UID
+    else if (order == MASK_NONE)    reason = DR_NO_ORDER;      // no order set for that house
+    else if (g_tags[idx].mask != order) reason = DR_WRONG_PIZZA; // wrong toppings
 
-    // Optional: nudge panel or play sound (commented out for now)
-    // sendPanelText(s->house_id, "Delivered!", 1, 1, 120);
-    // sendSoundPlay(s->house_id, 1, 220);
+    // Central tells the House if it’s ok + why
+    sendDeliverResult(s->house_id, (reason == DR_OK), reason);
     return;
   }
 
@@ -228,9 +302,23 @@ void setup() {
   PizzaNow::begin(ESPNOW_CHANNEL);
   PizzaNow::onReceive(onRx);
 
+  stateInit();
+
   // Help
-  Serial.println(F("CLI:\n  list\n  hello-req\n  panel <id> \"text\" [style] [speed] [bright]\n  sound <id> [clip] [vol]\n  update <ROLE> all|id=<n> [url]\n  claim <MAC> <id> [force]\n"));
-}
+  Serial.println(F(
+    "CLI:\n"
+    "  list\n"
+    "  hello-req\n"
+    "  panel <id> \"text\" [style] [speed] [bright]\n"
+    "  sound <id> [clip] [vol]\n"
+    "  update <ROLE> all|id=<n> [url]\n"
+    "  claim <MAC> <id> [force]\n"
+    "  order <id> <mask>\n"
+    "  order show [id]\n"
+    "  order clear <id>\n"
+    "  tags\n"
+  ));
+  }
 
 void loop() {
   PizzaNow::loop();
@@ -329,4 +417,60 @@ void loop() {
     sendClaim(mac, (uint8_t)id, force);
     return;
   }
+
+  /*** Block E: CLI – order/tags ***/
+  if (line.startsWith("order ")) {
+    String rest = line.substring(6); rest.trim();
+
+    if (rest.startsWith("show")) {
+      rest = rest.substring(4); rest.trim();
+      if (rest.length()) {
+        int id = rest.toInt();
+        if (id < 0 || id > 255) { Serial.println(F("usage: order show [id]")); return; }
+        Serial.print(F("order[")); Serial.print(id); Serial.print(F("]=")); printMask(g_orderMask[id]); Serial.println();
+      } else {
+        for (int i = 0; i < 256; ++i) if (g_orderMask[i] != MASK_NONE) {
+          Serial.print(F("order[")); Serial.print(i); Serial.print(F("]=")); printMask(g_orderMask[i]); Serial.println();
+        }
+      }
+      return;
+    }
+
+    if (rest.startsWith("clear")) {
+      rest = rest.substring(5); rest.trim();
+      int id = rest.toInt();
+      if (id < 0 || id > 255) { Serial.println(F("usage: order clear <id>")); return; }
+      g_orderMask[id] = MASK_NONE;
+      Serial.printf("order[%d] cleared\n", id);
+      return;
+    }
+
+    // order <id> <mask>
+    int space = rest.indexOf(' ');
+    if (space < 0) { Serial.println(F("usage: order <id> <mask>  (mask: 0..31 or 0xNN)")); return; }
+    int id = rest.substring(0, space).toInt();
+    String mstr = rest.substring(space + 1); mstr.trim();
+    long mask;
+    if (mstr.startsWith("0x") || mstr.startsWith("0X")) mask = strtol(mstr.c_str(), nullptr, 16);
+    else mask = mstr.toInt();
+    if (id < 0 || id > 255 || mask < 0 || mask > 31) { Serial.println(F("usage: order <id> <mask>")); return; }
+    g_orderMask[id] = (uint8_t)mask;
+    Serial.print(F("order[")); Serial.print(id); Serial.print(F("]=")); printMask(g_orderMask[id]); Serial.println();
+    return;
+  }
+
+  if (line == "tags") {
+    Serial.printf("tags (%u)\n", g_tagCount);
+    for (uint8_t i = 0; i < g_tagCount; ++i) {
+      Serial.printf("#%u ", i);
+      for (uint8_t k = 0; k < g_tags[i].len; ++k) {
+        if (g_tags[i].uid[k] < 16) Serial.print('0');
+        Serial.print(g_tags[i].uid[k], HEX);
+        if (k + 1 < g_tags[i].len) Serial.print(':');
+      }
+      Serial.print(F(" → ")); printMask(g_tags[i].mask); Serial.println();
+    }
+    return;
+  }
+
 }
