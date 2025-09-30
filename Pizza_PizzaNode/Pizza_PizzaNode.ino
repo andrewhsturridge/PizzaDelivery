@@ -95,9 +95,20 @@ static void sendIngrUpdate() {
           g_mask, !!(g_mask&1), !!(g_mask&2), !!(g_mask&4), !!(g_mask&8), !!(g_mask&16));
 }
 
+/*** Pizza Node: send ingredient QUERY for the current UID ***/
+static void sendIngrQuery() {
+  if (!g_haveTag || g_uidLen == 0) return;
+  PizzaIngrQueryPayload p{}; p.uid_len = g_uidLen; memcpy(p.uid, g_uid, g_uidLen);
+  uint8_t buf[128];
+  size_t n = PizzaProtocol::pack(PIZZA_ING_QUERY, (Role)PIZZA_ROLE, g_stationId, g_seq++, &p, sizeof(p), buf, sizeof(buf));
+  PizzaNow::sendBroadcast(buf, n);
+  PZ_LOGI("ING_QUERY uidLen=%u", g_uidLen);
+}
+
 static void tagAttached(const uint8_t* uid, uint8_t len) {
   memcpy(g_uid, uid, len); g_uidLen = len; g_haveTag = true; g_tagLastSeen = millis();
-  g_mask = 0; lampsApply(g_mask); // new card starts blank (all OFF)
+  g_mask = 0; lampsApply(g_mask);            // default to blank until snapshot arrives
+  sendIngrQuery();                           // NEW: ask Central for current mask
   PZ_LOGI("TAG ATTACH uidLen=%u", len);
 }
 
@@ -126,6 +137,22 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       PZ_LOGI("CLAIM: station_id=%u (force=%u)", cp->house_id, cp->force);
       cfgSaveStationId(cp->house_id);
       delay(50); ESP.restart();
+    }
+    return;
+  }
+
+  /*** Pizza Node: apply Central's ING_SNAPSHOT ***/
+  if (hdr.type == PIZZA_ING_SNAPSHOT && len >= sizeof(PizzaIngrSnapshotPayload)) {
+    const PizzaIngrSnapshotPayload* s = (const PizzaIngrSnapshotPayload*)payload;
+
+    // Only apply if we still have a card, and it’s the same UID
+    if (g_haveTag && s->uid_len == g_uidLen && memcmp(s->uid, g_uid, g_uidLen) == 0) {
+      uint8_t newMask = (s->ok ? s->mask : 0);
+      if (newMask != g_mask) {
+        g_mask = newMask;
+        lampsApply(g_mask);
+      }
+      PZ_LOGI("ING_SNAPSHOT ok=%u mask=0x%02X", s->ok, s->mask);
     }
     return;
   }

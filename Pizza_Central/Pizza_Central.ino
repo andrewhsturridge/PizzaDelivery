@@ -179,6 +179,14 @@ static void sendDeliverResult(uint8_t houseId, bool ok, uint8_t reason) {
   PZ_LOGI("DELIVER_RESULT -> house %u ok=%u reason=%u", houseId, p.ok, p.reason);
 }
 
+/*** Central: send ingredient snapshot ***/
+static void sendIngrSnapshot(const PizzaIngrSnapshotPayload& sp) {
+  uint8_t buf[128];
+  size_t n = PizzaProtocol::pack(PIZZA_ING_SNAPSHOT, CENTRAL, 0, g_seq++, &sp, sizeof(sp), buf, sizeof(buf));
+  PizzaNow::sendBroadcast(buf, n);
+  PZ_LOGI("ING_SNAPSHOT ok=%u mask=0x%02X", sp.ok, sp.mask);
+}
+
 static Role parseRole(const String& s) {
   if (s=="HOUSE_PANEL") return HOUSE_PANEL;
   if (s=="HOUSE_NODE")  return HOUSE_NODE;
@@ -265,6 +273,23 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
             hdr.house_id, u->mask,
             !!(u->mask&1), !!(u->mask&2), !!(u->mask&4), !!(u->mask&8), !!(u->mask&16));
     // TODO: store uid->mask in a small map so deliveries can be validated later.
+    return;
+  }
+
+  /*** Central: handle PIZZA_ING_QUERY -> broadcast snapshot ***/
+  if (hdr.type == PIZZA_ING_QUERY && len >= sizeof(PizzaIngrQueryPayload)) {
+    const PizzaIngrQueryPayload* q = (const PizzaIngrQueryPayload*)payload;
+
+    PizzaIngrSnapshotPayload s{};
+    s.uid_len = q->uid_len;
+    memcpy(s.uid, q->uid, q->uid_len);
+
+    // Look up in our in-memory cache (added earlier)
+    int idx = tagFind(q->uid, q->uid_len);
+    if (idx >= 0) { s.ok = 1; s.mask = g_tags[idx].mask; }
+    else          { s.ok = 0; s.mask = 0; }
+
+    sendIngrSnapshot(s);
     return;
   }
 
