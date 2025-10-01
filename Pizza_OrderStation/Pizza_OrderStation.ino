@@ -45,19 +45,20 @@ static void sendHello(){
 
 static void sendShowText(const char* s, bool force=false){
   const char* safe = (s && *s) ? s : "NO ORDERS";
-  uint32_t now = millis();
-  // dedupe: if same as last and within window, skip
-  if (!force && strncmp(g_lastSent, safe, sizeof(g_lastSent)) == 0 &&
-      (int32_t)(now - g_lastSentAt) < (int32_t)RESEND_MIN_MS) {
+
+  // STRICT DEDUPE: if text is identical, do nothing unless forced
+  if (!force && strncmp(g_lastSent, safe, sizeof(g_lastSent)) == 0) {
     return;
   }
 
   PzOrderShowTextPayload p{}; strlcpy(p.text, safe, sizeof(p.text));
-  uint8_t buf[256]; size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, (Role)PIZZA_ROLE, 0, g_seq++, &p, sizeof(p), buf, sizeof(buf));
+
+  uint8_t buf[256];
+  size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, (Role)PIZZA_ROLE, 0, g_seq++, &p, sizeof(p), buf, sizeof(buf));
   PizzaNow::sendBroadcast(buf, n);
 
   strlcpy(g_lastSent, safe, sizeof(g_lastSent));
-  g_lastSentAt = now;
+  g_lastSentAt = millis();   // keep if you also use time-based suppression elsewhere
   Serial.printf("[OrdersNode] ORDER_SHOW_TEXT len=%u\n", (unsigned)strlen(p.text));
 }
 
@@ -84,6 +85,17 @@ static void recomputeCountContiguous() {
     c = i + 1;
   }
   g_count = c;
+}
+
+// OTA progress -> blink lamp on each 10% step
+static void otaLampProgress(size_t written, size_t total) {
+  if (!total) return;
+  uint8_t step = (uint8_t)((written * 10ULL) / total);  // 0..10
+  static uint8_t lastStep = 255;
+  if (step == lastStep) return;
+  lastStep = step;
+  // alternate lamp each step: ON at 0%, OFF at 10%, ON at 20%, etc.
+  digitalWrite(LAMP_PIN, (step % 2 == 0) ? HIGH : LOW);
 }
 
 // ---------- Rx handler ----------
@@ -139,6 +151,7 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
   }
 
   if (hdr.type == OTA_START && len >= sizeof(OtaStartPayload)){
+    digitalWrite(LAMP_PIN, LOW);   // immediately signal "starting OTA"
     const auto* p = (const OtaStartPayload*)payload;
     if (!matchOtaTarget(p)) return;
     OtaAckPayload ack{}; ack.accept=1; ack.code=0;
@@ -161,7 +174,9 @@ void setup(){
   if (!PizzaNow::begin(ESPNOW_CHANNEL)) { PZ_LOGE("ESPNOW init failed"); }
   PizzaNow::onReceive(onRx);
 
-  sendShowText("NO ORDERS", /*force*/true); // boot banner
+  PizzaOta::setProgressCallback(otaLampProgress);
+
+  showNoOrders(); // calls sendShowText(..., force=false)
   sendHello();
 }
 
@@ -174,6 +189,7 @@ void loop(){
     if (run){
       auto res = PizzaOta::start(g_otaUrl, g_otaVer, OTA_TOTAL_MS);
       if (res != PizzaOta::OK){
+        for (int i=0;i<3;i++){ digitalWrite(LAMP_PIN, LOW); delay(120); digitalWrite(LAMP_PIN, HIGH); delay(120); }
         OtaResultPayload rr{}; rr.ok=0; rr.code=(uint8_t)res;
         uint8_t out[64]; size_t n = PizzaProtocol::pack(OTA_RESULT, (Role)PIZZA_ROLE, PIZZA_HOUSE_ID, g_seq++, &rr, sizeof(rr), out, sizeof(out));
         PizzaNow::sendBroadcast(out, n);
