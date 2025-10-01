@@ -1,4 +1,4 @@
-// Role: ORDERS_PANEL (MatrixPortal S3) – show text sent by Orders Node (HousePanel-style scrolling)
+// Role: ORDERS_PANEL (MatrixPortal S3) – show text from Orders Node using the SAME path/font as HousePanels
 #define PIZZA_ROLE ORDERS_PANEL
 #define PIZZA_HOUSE_ID 0
 
@@ -8,7 +8,7 @@
 #include "PizzaIdentity.h"
 #include "PizzaUtils.h"
 #include "BuildConfig.h"
-#include "PizzaPanel.h"  // <- same helper your HousePanel uses
+#include "PizzaPanel.h"  // <-- same helper HousePanels use
 #include "PizzaOta.h"
 
 static uint16_t g_seq = 1;
@@ -19,6 +19,9 @@ static bool g_inOta = false;
 static char g_otaUrl[160] = {0};
 static char g_otaVer[12]  = {0};
 
+// Dedupe to avoid log/render spam
+static char g_lastShown[PZ_ORDER_TEXT_MAX] = {0};
+
 static void sendHello(){
   HelloPayload hp{}; strlcpy(hp.fw, PizzaIdentity::fw(), sizeof(hp.fw));
   hp.proto = PROTOCOL_VERSION; PizzaIdentity::mac(hp.mac);
@@ -28,7 +31,7 @@ static void sendHello(){
   PZ_LOGI("HELLO sent (orders-panel)");
 }
 
-// Simple bottom progress bar during OTA (same pattern as HousePanel)
+// Same bottom progress bar behavior as HousePanel
 static void panelOtaBottomBar(size_t written, size_t total){
   if (!total) return;
   uint8_t pct = (uint8_t)((written * 100ULL) / total);
@@ -42,15 +45,21 @@ static bool matchOtaTarget(const OtaStartPayload* p){
   return false;
 }
 
-// Rx handler – signature matches PizzaNow::RxHandler
+// Signature matches PizzaNow::RxHandler
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t /*srcMac*/[6]){
   if (hdr.type == HELLO_REQ){ sendHello(); return; }
 
-  if (hdr.type == ORDER_SHOW_TEXT && !g_inOta && len >= sizeof(PzOrderShowTextPayload)){
+  if (hdr.type == ORDER_SHOW_TEXT && !g_inOta && len >= sizeof(PzOrderShowTextPayload)) {
     const auto* p = (const PzOrderShowTextPayload*)payload;
-    // STYLE=0 → scrolling in your PizzaPanel helper, SPEED=2 is a nice default
-    PizzaPanel::showText(p->text, /*style*/0, /*speed*/2, /*bright*/100);
-    PZ_LOGI("SHOW_TEXT: \"%s\"", p->text);
+
+    // De-dupe: only redraw/log when the text actually changes
+    if (strncmp(g_lastShown, p->text, sizeof(g_lastShown)) != 0) {
+      strlcpy(g_lastShown, p->text, sizeof(g_lastShown));
+      PizzaPanel::setWeight(0);  // 1 is subtle bold
+      // EXACT look as HousePanels: style=0 (scroll), speed=2, bright=100
+      PizzaPanel::showText(p->text, /*style*/2, /*speed*/2, /*bright*/100);
+      PZ_LOGI("SHOW_TEXT: \"%s\"", p->text);
+    }
     return;
   }
 
@@ -76,11 +85,14 @@ void setup(){
   Serial.begin(115200); delay(100);
   PZ_LOGI("OrdersPanel boot fw=%s mac=%s", PizzaIdentity::fw(), PizzaIdentity::macStr().c_str());
 
-  // Use the same panel init your HousePanel uses
+  // Initialize panel EXACTLY like HousePanels
   if (!PizzaPanel::begin64x32(/*brightness*/100)) {
     PZ_LOGE("Panel init failed");
   }
-  // Show something at boot (your helper animates/scrolls this as needed)
+
+  PizzaPanel::setColor(0, 160, 255);  // **blue** (RGB)
+  
+  // Boot banner via the same helper
   PizzaPanel::showText("BOOT", /*style*/0, /*speed*/2, /*bright*/100);
 
   PizzaOta::setProgressCallback(panelOtaBottomBar);
@@ -97,11 +109,11 @@ void loop(){
   PizzaNow::loop();
 
   if (!g_inOta) {
-    // IMPORTANT: this drives the scroll/animations
+    // IMPORTANT: drives scroll/animation inside PizzaPanel
     PizzaPanel::loop();
   }
 
-  // Deferred OTA (same flow as your other nodes)
+  // Deferred OTA (same flow as HousePanels)
   if (g_otaPending){
     noInterrupts(); bool run = g_otaPending; g_otaPending=false; interrupts();
     if (run){

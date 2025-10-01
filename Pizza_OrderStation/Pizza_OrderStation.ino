@@ -1,4 +1,4 @@
-// Role: ORDERS_NODE (ESP32-WROOM) – single button cycles orders; shows text on panel
+// Role: ORDERS_NODE (ESP32-WROOM) – auto-displays orders list + button cycles items
 #define PIZZA_ROLE ORDERS_NODE
 #define PIZZA_HOUSE_ID 0
 
@@ -16,11 +16,18 @@
 static uint16_t g_seq = 1;
 
 // Orders list
-static uint8_t g_expected = 0, g_count = 0, g_index = 0;
+static uint8_t g_expected = 0;
+static uint8_t g_count    = 0;
+static uint8_t g_index    = 0;
 static PzOrderItemSetPayload g_items[PZ_ORDERS_MAX];
 
+// Dedup / anti-spam
+static char     g_lastSent[PZ_ORDER_TEXT_MAX] = {0};
+static uint32_t g_lastSentAt = 0;
+static const uint32_t RESEND_MIN_MS = 5000; // don't resend identical text more often than this
+
 // Debounce
-static bool g_lastRaw = true, g_btn = true;
+static bool     g_lastRaw = true, g_btn = true;
 static uint32_t g_lastEdgeMs = 0;
 
 // OTA deferral
@@ -28,6 +35,7 @@ static volatile bool g_otaPending = false;
 static char g_otaUrl[160] = {0};
 static char g_otaVer[12]  = {0};
 
+// ---------- helpers ----------
 static void sendHello(){
   HelloPayload hp{}; strlcpy(hp.fw, PizzaIdentity::fw(), sizeof(hp.fw));
   hp.proto = PROTOCOL_VERSION; PizzaIdentity::mac(hp.mac);
@@ -35,13 +43,50 @@ static void sendHello(){
   PizzaNow::sendBroadcast(out, n); PZ_LOGI("HELLO sent (orders-node)");
 }
 
-static void sendShowText(const char* s){
-  PzOrderShowTextPayload p{}; if (s) strlcpy(p.text, s, sizeof(p.text));
+static void sendShowText(const char* s, bool force=false){
+  const char* safe = (s && *s) ? s : "NO ORDERS";
+  uint32_t now = millis();
+  // dedupe: if same as last and within window, skip
+  if (!force && strncmp(g_lastSent, safe, sizeof(g_lastSent)) == 0 &&
+      (int32_t)(now - g_lastSentAt) < (int32_t)RESEND_MIN_MS) {
+    return;
+  }
+
+  PzOrderShowTextPayload p{}; strlcpy(p.text, safe, sizeof(p.text));
   uint8_t buf[256]; size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, (Role)PIZZA_ROLE, 0, g_seq++, &p, sizeof(p), buf, sizeof(buf));
   PizzaNow::sendBroadcast(buf, n);
+
+  strlcpy(g_lastSent, safe, sizeof(g_lastSent));
+  g_lastSentAt = now;
   Serial.printf("[OrdersNode] ORDER_SHOW_TEXT len=%u\n", (unsigned)strlen(p.text));
 }
 
+static void showNoOrders() {
+  sendShowText("NO ORDERS");
+}
+
+static void showCurrent(bool force=false) {
+  if (g_count == 0) { showNoOrders(); return; }
+  if (g_index >= g_count) g_index = 0;
+  sendShowText(g_items[g_index].text, force);
+}
+
+static void clearItems() {
+  for (uint8_t i=0;i<PZ_ORDERS_MAX;i++){
+    g_items[i].index=i; g_items[i].house_id=0; g_items[i].mask=0; memset(g_items[i].text,0,sizeof(g_items[i].text));
+  }
+}
+
+static void recomputeCountContiguous() {
+  uint8_t c = 0;
+  for (uint8_t i=0;i<g_expected;i++){
+    if (g_items[i].text[0] == 0) break;
+    c = i + 1;
+  }
+  g_count = c;
+}
+
+// ---------- Rx handler ----------
 static bool matchOtaTarget(const OtaStartPayload* p){
   if (p->target_role != (uint8_t)PIZZA_ROLE) return false;
   if (p->scope == 0) return true; // ALL
@@ -49,29 +94,50 @@ static bool matchOtaTarget(const OtaStartPayload* p){
   return false;
 }
 
+// signature matches PizzaNow::RxHandler
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t /*srcMac*/[6]){
   if (hdr.type == HELLO_REQ){ sendHello(); return; }
 
   if (hdr.type == ORDER_LIST_RESET && len >= sizeof(PzOrderListResetPayload)){
     const auto* p = (const PzOrderListResetPayload*)payload;
-    g_expected = min<uint8_t>(p->count, PZ_ORDERS_MAX); g_count = 0; g_index = 0;
-    for (uint8_t i=0;i<PZ_ORDERS_MAX;i++){ g_items[i].index=i; g_items[i].house_id=0; g_items[i].mask=0; memset(g_items[i].text,0,sizeof(g_items[i].text)); }
+    g_expected = min<uint8_t>(p->count, PZ_ORDERS_MAX);
+    clearItems();
+    g_count = 0; g_index = 0;
     Serial.printf("[OrdersNode] RESET expect=%u\n", g_expected);
+    if (g_expected == 0) showNoOrders();
     return;
   }
 
   if (hdr.type == ORDER_ITEM_SET && len >= sizeof(PzOrderItemSetPayload)){
     const auto* p = (const PzOrderItemSetPayload*)payload;
     if (p->index < PZ_ORDERS_MAX && p->index < g_expected){
+      uint8_t oldCount = g_count;
       g_items[p->index] = *p;
-      uint8_t newCount=0; for (uint8_t i=0;i<g_expected;i++){ if (g_items[i].text[0]==0 && i>=g_count) break; newCount=i+1; }
-      g_count = newCount;
-      Serial.printf("[OrdersNode] ITEM idx=%u (count=%u/%u)\n", p->index, g_count, g_expected);
+      recomputeCountContiguous();
+
+      // If list grew from 0 -> >0, start at first item immediately
+      if (oldCount == 0 && g_count > 0) {
+        g_index = 0;
+        showCurrent(/*force*/true); // ensure first draw
+        return;
+      }
+
+      // If current index went out of range (list shrank), clamp & show
+      if (g_count == 0) {
+        showNoOrders(); return;
+      }
+      if (g_index >= g_count) {
+        g_index = 0; showCurrent(/*force*/true); return;
+      }
+
+      // If the item we are displaying was updated, refresh the panel (dedup guards inside)
+      if (p->index == g_index) {
+        showCurrent();
+      }
     }
     return;
   }
 
-  // OTA_START
   if (hdr.type == OTA_START && len >= sizeof(OtaStartPayload)){
     const auto* p = (const OtaStartPayload*)payload;
     if (!matchOtaTarget(p)) return;
@@ -87,8 +153,15 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 void setup(){
   Serial.begin(115200); delay(50);
   Serial.printf("[OrdersNode] fw=%s mac=%s\n", PizzaIdentity::fw(), PizzaIdentity::macStr().c_str());
-  pinMode(BTN_PIN, INPUT_PULLUP); pinMode(LAMP_PIN, OUTPUT); digitalWrite(LAMP_PIN, HIGH);
-  PizzaNow::begin(ESPNOW_CHANNEL); PizzaNow::onReceive(onRx);
+
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  pinMode(LAMP_PIN, OUTPUT);
+  digitalWrite(LAMP_PIN, HIGH);
+
+  if (!PizzaNow::begin(ESPNOW_CHANNEL)) { PZ_LOGE("ESPNOW init failed"); }
+  PizzaNow::onReceive(onRx);
+
+  sendShowText("NO ORDERS", /*force*/true); // boot banner
   sendHello();
 }
 
@@ -108,7 +181,7 @@ void loop(){
     }
   }
 
-  // Debounced short press → next order
+  // Button: manual next (still supported)
   bool raw = digitalRead(BTN_PIN);
   if (raw != g_lastRaw){ g_lastRaw=raw; g_lastEdgeMs=millis(); }
   if (millis() - g_lastEdgeMs > 35){
@@ -116,8 +189,12 @@ void loop(){
       g_btn = raw;
       if (g_btn == LOW){
         digitalWrite(LAMP_PIN, LOW); delay(60); digitalWrite(LAMP_PIN, HIGH);
-        if (g_count > 0){ g_index = (g_index + 1) % g_count; sendShowText(g_items[g_index].text); }
-        else            { sendShowText("NO ORDERS"); }
+        if (g_count > 0){
+          g_index = (g_index + 1) % g_count;
+          showCurrent(/*force*/true);
+        } else {
+          showNoOrders();
+        }
       }
     }
   }

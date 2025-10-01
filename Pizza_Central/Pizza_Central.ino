@@ -237,6 +237,18 @@ static void ordersPushAll() {
   for (uint8_t i=0;i<g_orderCount;i++) ordersSendItem(g_orders[i]);
 }
 
+/*** CENTRAL: send ORDER_SHOW_TEXT directly to the panel ***/
+static void ordersSendShowText(const char* s) {
+  PzOrderShowTextPayload p{};
+  if (s && *s) strlcpy(p.text, s, sizeof(p.text));
+  else         strcpy(p.text, "NO ORDERS");
+
+  uint8_t buf[256];
+  size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, CENTRAL, 0, g_seq_orders++, &p, sizeof(p), buf, sizeof(buf));
+  PizzaNow::sendBroadcast(buf, n);
+  Serial.printf("[Central] ORDER_SHOW_TEXT len=%u\n", (unsigned)strlen(p.text));
+}
+
 static Role parseRole(const String& s) {
   if (s=="HOUSE_PANEL") return HOUSE_PANEL;
   if (s=="HOUSE_NODE")  return HOUSE_NODE;
@@ -369,6 +381,46 @@ static String readLine() {
 
 static int parseInt(const String& s, int def=0){ char* e=nullptr; long v=strtol(s.c_str(), &e, 10); return (e && *e==0)? (int)v : def; }
 
+/*** Central CLI: help printer ***/
+static void printHelp() {
+  Serial.println(F("=== Central CLI Help ==="));
+  Serial.println(F(""));
+  Serial.println(F("General"));
+  Serial.println(F("  help | ?                       Show this help"));
+  Serial.println(F("  list                           Print device roster"));
+  Serial.println(F("  hello-req                      Ask nodes to send HELLO"));
+  Serial.println(F(""));
+  Serial.println(F("Panels"));
+  Serial.println(F("  panel <id> \"text\" [style] [speed] [bright]"));
+  Serial.println(F("      style: 0=scroll, 1=static (see PizzaPanel defs)"));
+  Serial.println(F("      speed: 1..5, bright: 0..255"));
+  Serial.println(F(""));
+  Serial.println(F("Sound"));
+  Serial.println(F("  sound <id> [clip] [vol]        vol: 0..255"));
+  Serial.println(F(""));
+  Serial.println(F("OTA / Updates"));
+  Serial.println(F("  update <ROLE> all|id=<n> [url]"));
+  Serial.println(F("      ROLE: HOUSE_PANEL | HOUSE_NODE | ORDERS_PANEL | ORDERS_NODE | PIZZA_NODE | CENTRAL"));
+  Serial.println(F(""));
+  Serial.println(F("Claiming"));
+  Serial.println(F("  claim <MAC> <id> [force]       ex: claim AA:BB:CC:DD:EE:FF 3"));
+  Serial.println(F(""));
+  Serial.println(F("Delivery Validator (per-house mask)"));
+  Serial.println(F("  order <id> <mask>              set target mask for house (0..31 or 0xNN)"));
+  Serial.println(F("  order show [id]                show orders (all or one)"));
+  Serial.println(F("  order clear <id>               clear order for a house"));
+  Serial.println(F("  tags                           list remembered uid->mask cache"));
+  Serial.println(F(""));
+  Serial.println(F("Operator Orders (text list for Orders Node/Panel)"));
+  Serial.println(F("  orders reset                   clear local list (max 6 items)"));
+  Serial.println(F("  orders add <house> <mask> \"text\""));
+  Serial.println(F("  orders show                    print local list"));
+  Serial.println(F("  orders push                    broadcast list to Orders Node"));
+  Serial.println(F("  orders showidx <n>             display item n on Orders Panel"));
+  Serial.println(F("  orders show \"text\"            display ad-hoc text on Orders Panel"));
+  Serial.println();
+}
+
 void setup() {
   Serial.begin(115200); delay(100);
   PZ_LOGI("Central boot fw=%s mac=%s", PizzaIdentity::fw(), PizzaIdentity::macStr().c_str());
@@ -380,20 +432,8 @@ void setup() {
   stateInit();
 
   // Help
-  Serial.println(F(
-    "CLI:\n"
-    "  list\n"
-    "  hello-req\n"
-    "  panel <id> \"text\" [style] [speed] [bright]\n"
-    "  sound <id> [clip] [vol]\n"
-    "  update <ROLE> all|id=<n> [url]\n"
-    "  claim <MAC> <id> [force]\n"
-    "  order <id> <mask>\n"
-    "  order show [id]\n"
-    "  order clear <id>\n"
-    "  tags\n"
-  ));
-  }
+  Serial.println(F("Type 'help' for commands."));
+}
 
 void loop() {
   PizzaNow::loop();
@@ -402,6 +442,8 @@ void loop() {
   if (!line.length()) return;
   line.trim();
 
+  /*** Central CLI: help entrypoint ***/
+  if (line == "help" || line == "?") { printHelp(); return; }
   if (line == "list") { rosterPrint(); return; }
   if (line == "hello-req") { sendHelloReq(); return; }
 
@@ -593,6 +635,24 @@ void loop() {
         return;
       }
       Serial.println("orders: added");
+      return;
+    }
+
+    // orders showidx <n>  -> send text of item n to panel
+    if (rest.startsWith("showidx ")) {
+      int n = rest.substring(8).toInt();
+      if (n < 0 || n >= g_orderCount) { Serial.println("usage: orders showidx <0..count-1>"); return; }
+      ordersSendShowText(g_orders[n].text);
+      return;
+    }
+
+    // orders show "text..." -> send arbitrary text to panel
+    if (rest.startsWith("show ")) {
+      String txt = rest.substring(5); txt.trim();
+      if (txt.length() && txt[0]=='"' && txt[txt.length()-1]=='"') {
+        txt = txt.substring(1, txt.length()-1);
+      }
+      ordersSendShowText(txt.c_str());
       return;
     }
 
