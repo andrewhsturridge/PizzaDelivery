@@ -165,10 +165,21 @@ static void rosterPrint() {
       case PIZZA_NODE:  rn="PIZZA_NODE "; break;
       case CENTRAL:     rn="CENTRAL    "; break;
     }
-    Serial.printf("%-12s  %2u   %-8s  %-17s  %9u\n",
-      rn, g_devices[i].house_id, g_devices[i].fw, macbuf, (unsigned)g_devices[i].last_seen_ms);
+    uint32_t last = g_devices[i].last_seen_ms;
+    uint32_t age  = millis() - last;
+    Serial.printf("%-12s  %2u   %-8s  %-17s  %9u  %7us\n",
+      rn, g_devices[i].house_id, g_devices[i].fw, macbuf,
+      (unsigned)last, (unsigned)(age/1000));
   }
   Serial.println();
+}
+
+static void rosterTouch(const uint8_t mac[6], uint8_t role, uint8_t house_id){
+  int idx = allocSlotForMac(mac);
+  if (idx < 0) return;
+  g_devices[idx].last_seen_ms = millis();
+  if (role)     g_devices[idx].role = (Role)role;
+  if (house_id) g_devices[idx].house_id = house_id;
 }
 
 // -------------------- SENDERS --------------------
@@ -295,6 +306,7 @@ static void sendClaim(const uint8_t mac[6], uint8_t newId, bool force=false) {
 // -------------------- RX HANDLER --------------------
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t srcMac[6]) {
   char macbuf[18]; macToStr(srcMac, macbuf);
+  rosterTouch(srcMac, hdr.role, hdr.house_id);
 
   /*** Block B: onRx – PIZZA_ING_UPDATE -> remember uid→mask ***/
   if (hdr.type == PIZZA_ING_UPDATE && len >= sizeof(PizzaIngrUpdatePayload)) {

@@ -18,6 +18,7 @@ static uint16_t g_seq = 1;
 // --- Persistent house_id (NVS) ---
 Preferences prefs;
 static uint8_t g_houseId = 0; // 0 = unclaimed
+static uint32_t g_helloDueAt = 0;
 
 // --- OTA deferral ---
 static volatile bool g_otaPending = false;
@@ -92,7 +93,11 @@ static void panelOtaBottomBar(size_t written, size_t total) {
 
 // --- RX handler ---
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t /*srcMac*/[6]) {
-  if (hdr.type == HELLO_REQ) { sendHello(); return; }
+  if (hdr.type == HELLO_REQ) { 
+    uint32_t jitter = 50 + (esp_random() % 300);           // 50..350 ms
+    g_helloDueAt = millis() + jitter + ((PIZZA_HOUSE_ID & 7) * 40);
+    return;
+   }
 
   if (hdr.type == PANEL_TEXT && !g_inOta && len >= sizeof(PanelTextPayload)) {
     const PanelTextPayload* p = (const PanelTextPayload*)payload;
@@ -163,6 +168,11 @@ void setup() {
 
 void loop() {
   PizzaNow::loop();
+
+  if (g_helloDueAt && (int32_t)(millis() - g_helloDueAt) >= 0) {
+    sendHello();
+    g_helloDueAt = 0;
+  }
 
   if (!g_inOta) {
     PizzaPanel::loop();                  // will early-return unless style==0

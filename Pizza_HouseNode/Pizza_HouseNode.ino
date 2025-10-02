@@ -24,6 +24,7 @@
 static uint16_t g_seq = 1;
 Preferences prefs;
 static uint8_t g_houseId = 0;  // runtime house id from NVS
+static uint32_t g_helloDueAt = 0;
 
 // --- Pins (House 1 mapping) ---
 static const uint8_t  PIN_WS2812 = 38;
@@ -97,7 +98,11 @@ static void sendDeliverScan(const uint8_t* uid, uint8_t uidLen) {
 }
 
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t /*srcMac*/[6]) {
-  if (hdr.type == HELLO_REQ) { sendHello(); return; }
+  if (hdr.type == HELLO_REQ) { 
+    uint32_t jitter = 50 + (esp_random() % 300);           // 50..350 ms
+    g_helloDueAt = millis() + jitter + ((PIZZA_HOUSE_ID & 7) * 40);
+    return;
+   }
 
   /*** onRx: delivery verdict from Central ***/
   if (hdr.type == DELIVER_RESULT && len >= sizeof(DeliverResultPayload)) {
@@ -256,6 +261,11 @@ void setup() {
 
 void loop() {
   PizzaNow::loop();
+
+  if (g_helloDueAt && (int32_t)(millis() - g_helloDueAt) >= 0) {
+    sendHello();
+    g_helloDueAt = 0;
+  }
 
   if (g_otaPending) {
     // take the job atomically
