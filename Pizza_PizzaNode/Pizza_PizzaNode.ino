@@ -34,6 +34,7 @@ static const uint8_t LMP[5] = {2, 15, 27, 12, 5};
 
 // ---------------- Globals ----------------
 static uint16_t g_seq = 1;
+static uint32_t g_helloDueAt = 0;
 
 // NVS: persistent station id (CLAIM sets this once)
 #include <Preferences.h>
@@ -127,7 +128,11 @@ static bool matchOtaTarget(const OtaStartPayload* p) {
 }
 
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t /*srcMac*/[6]) {
-  if (hdr.type == HELLO_REQ) { sendHello(); return; }
+  if (hdr.type == HELLO_REQ) { 
+    uint32_t jitter = 50 + (esp_random() % 300);           // 50..350 ms
+    g_helloDueAt = millis() + jitter + ((PIZZA_HOUSE_ID & 7) * 40);
+    return;
+   }
 
   // CLAIM (same as houses; sets a persistent station id)
   if (hdr.type == CLAIM && len >= sizeof(ClaimPayload)) {
@@ -198,6 +203,11 @@ void setup() {
 
 void loop() {
   PizzaNow::loop();
+
+  if (g_helloDueAt && (int32_t)(millis() - g_helloDueAt) >= 0) {
+    sendHello();
+    g_helloDueAt = 0;
+  }
 
   // OTA deferral
   if (g_otaPending) {

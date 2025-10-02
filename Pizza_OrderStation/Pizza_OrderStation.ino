@@ -14,6 +14,7 @@
 #define LAMP_PIN 27
 
 static uint16_t g_seq = 1;
+static uint32_t g_helloDueAt = 0;
 
 // Orders list
 static uint8_t g_expected = 0;
@@ -108,7 +109,11 @@ static bool matchOtaTarget(const OtaStartPayload* p){
 
 // signature matches PizzaNow::RxHandler
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t /*srcMac*/[6]){
-  if (hdr.type == HELLO_REQ){ sendHello(); return; }
+  if (hdr.type == HELLO_REQ){ 
+    uint32_t jitter = 50 + (esp_random() % 300);           // 50..350 ms
+    g_helloDueAt = millis() + jitter + ((PIZZA_HOUSE_ID & 7) * 40);
+    return;
+   }
 
   if (hdr.type == ORDER_LIST_RESET && len >= sizeof(PzOrderListResetPayload)){
     const auto* p = (const PzOrderListResetPayload*)payload;
@@ -182,6 +187,11 @@ void setup(){
 
 void loop(){
   PizzaNow::loop();
+
+  if (g_helloDueAt && (int32_t)(millis() - g_helloDueAt) >= 0) {
+    sendHello();
+    g_helloDueAt = 0;
+  }
 
   // OTA (deferred)
   if (g_otaPending){
