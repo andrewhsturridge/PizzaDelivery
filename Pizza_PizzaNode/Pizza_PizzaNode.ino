@@ -12,6 +12,8 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <SPI.h>
+#include <Adafruit_NeoPixel.h>
+
 #include "PizzaProtocol.h"
 #include "PizzaNow.h"
 #include "PizzaIdentity.h"
@@ -19,6 +21,19 @@
 #include "BuildConfig.h"
 #include "PizzaRfid.h"
 #include "PizzaOta.h"
+
+// ---------- Generic NeoPixel Ring Config ----------
+#ifndef NEOPIXEL_PIN
+#define NEOPIXEL_PIN        4       // DIN (yours is GPIO 4)
+#endif
+#ifndef NEOPIXEL_COUNT
+#define NEOPIXEL_COUNT      20      // your ring size
+#endif
+#ifndef NEOPIXEL_BRIGHTNESS
+#define NEOPIXEL_BRIGHTNESS 100
+#endif
+
+static Adafruit_NeoPixel neopixelRing(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // ---------------- Pins (your map) ----------------
 static const uint8_t RFID_CS  = 21;  // SDA
@@ -45,6 +60,11 @@ static uint8_t g_stationId = 0; // 0 = unclaimed
 static volatile bool g_otaPending = false;
 static char g_otaUrl[160] = {0};
 static char g_otaVer[12]  = {0};
+
+// OTA progress state (updated by callback, rendered in loop)
+static volatile size_t otaDone  = 0;
+static volatile size_t otaTotal = 0;
+static volatile bool   otaActive = false;
 
 // Current tag + mask
 static uint8_t g_uid[10]; static uint8_t g_uidLen = 0;
@@ -119,6 +139,69 @@ static void tagDetached() {
   PZ_LOGI("TAG DETACH");
 }
 
+// ---------- Neopixel helpers ----------
+static void neoRingInit() {
+  neopixelRing.begin();
+  neopixelRing.setBrightness(NEOPIXEL_BRIGHTNESS);
+  neopixelRing.show();
+}
+
+static void neoRingClear() {
+  for (uint16_t i=0;i<NEOPIXEL_COUNT;i++) neopixelRing.setPixelColor(i, 0);
+  neopixelRing.show();
+}
+
+// Call when OTA campaign *for this device* begins (after target check)
+static void neoRingBegin() {
+  otaActive = true;
+  otaDone   = 0;
+  otaTotal  = 0; // spinner mode until total known
+}
+
+// Register this with your OTA engine (PizzaOta or Update)
+// Render directly from the progress callback (works even while OTA is blocking)
+static void neoRingProgressDirectCB(size_t done, size_t total) {
+  // (optional) keep vars updated too
+  otaDone = done; otaTotal = total; otaActive = true;
+
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last < 30) return;   // throttle to ~33 FPS
+  last = now;
+
+  if (total == 0) {
+    // Spinner while size unknown
+    static uint8_t pos = 0;
+    for (uint16_t i=0;i<NEOPIXEL_COUNT;i++) neopixelRing.setPixelColor(i, 0);
+    neopixelRing.setPixelColor(pos % NEOPIXEL_COUNT,     neopixelRing.Color(0,0,40)); // head
+    neopixelRing.setPixelColor((pos+1) % NEOPIXEL_COUNT, neopixelRing.Color(0,0,10)); // tail
+    neopixelRing.show();
+    pos++;
+    return;
+  }
+
+  // Fill based on progress
+  uint16_t lit = (uint32_t)done * NEOPIXEL_COUNT / total;  // 0..N
+  for (uint16_t i=0;i<NEOPIXEL_COUNT;i++)
+    neopixelRing.setPixelColor(i, (i < lit) ? neopixelRing.Color(0,50,50) : 0);
+  if (lit < NEOPIXEL_COUNT) neopixelRing.setPixelColor(lit, neopixelRing.Color(0,10,40)); // head
+  neopixelRing.show();
+
+  if (done == total) {
+    // Brief success flash; reboot typically follows
+    for (uint16_t i=0;i<NEOPIXEL_COUNT;i++) neopixelRing.setPixelColor(i, neopixelRing.Color(0,60,0));
+    neopixelRing.show();
+  }
+}
+
+static void neoRingBlinkError() {
+  for (int k=0;k<3;k++) {
+    for (uint16_t i=0;i<NEOPIXEL_COUNT;i++) neopixelRing.setPixelColor(i, neopixelRing.Color(80,0,0));
+    neopixelRing.show(); delay(120);
+    neoRingClear(); delay(120);
+  }
+}
+
 // ---------------- RX handler ----------------
 static bool matchOtaTarget(const OtaStartPayload* p) {
   if (p->target_role != (uint8_t)PIZZA_ROLE) return false;
@@ -166,6 +249,8 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
   if (hdr.type == OTA_START && len >= sizeof(OtaStartPayload)) {
     const OtaStartPayload* p = (const OtaStartPayload*)payload;
     if (!matchOtaTarget(p)) return;
+    for (int i=0;i<5;i++) { pinMode(LMP[i], OUTPUT); digitalWrite(LMP[i], LOW); }
+    neoRingBegin();
     OtaAckPayload ack{}; ack.accept = 1; ack.code = 0;
     uint8_t out[64]; size_t n = PizzaProtocol::pack(OTA_ACK, (Role)PIZZA_ROLE, g_stationId, g_seq++, &ack, sizeof(ack), out, sizeof(out));
     PizzaNow::sendBroadcast(out, n);
@@ -198,6 +283,10 @@ void setup() {
   // Radio
   PizzaNow::begin(ESPNOW_CHANNEL);
   PizzaNow::onReceive(onRx);
+
+  neoRingInit();
+  PizzaOta::setProgressCallback(neoRingProgressDirectCB);
+
   sendHello();
 }
 
@@ -216,6 +305,9 @@ void loop() {
       // (No panel here; just run OTA)
       auto res = PizzaOta::start(g_otaUrl, g_otaVer, OTA_TOTAL_MS);
       if (res != PizzaOta::OK) {
+        neoRingBlinkError();
+        otaActive = false;
+        neoRingClear();
         OtaResultPayload rr{}; rr.ok = 0; rr.code = (uint8_t)res;
         uint8_t out[64]; size_t n = PizzaProtocol::pack(OTA_RESULT, (Role)PIZZA_ROLE, g_stationId, g_seq++, &rr, sizeof(rr), out, sizeof(out));
         PizzaNow::sendBroadcast(out, n);
