@@ -14,6 +14,7 @@
 #include <FS.h>
 #include <LittleFS.h>
 #include <HTTPClient.h>
+#include <esp_wifi.h>
 
 #include "PizzaProtocol.h"
 #include "PizzaNow.h"
@@ -47,6 +48,11 @@ static volatile bool g_otaPending = false;
 static char g_otaUrl[160] = {0};
 static char g_otaVer[12]  = {0};
 
+// --- clip sync deferral ---
+static volatile bool g_assetPending = false;
+static volatile bool g_assetBusy    = false;
+static AssetSyncPayload g_assetReq; // saved request copied from onRx
+
 Adafruit_NeoPixel strip(LED_COUNT, PIN_WS2812, NEO_GRB + NEO_KHZ800);
 
 // --- Beep buffer (22050 Hz, ~200ms, 1kHz sine) ---
@@ -77,6 +83,9 @@ static uint32_t g_absentSince  = 0;
 static uint8_t  g_winFx   = WIN_FX_OFF;
 static uint8_t  g_winH=0, g_winS=0, g_winV=0, g_winSpd=0;
 static uint32_t g_nextFxAt = 0;     // scheduling for rainbow/party
+
+// Forward declares
+static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t srcMac[6]);
 
 static void fillBeep() {
   const float freq = 1000.0f, sr = 22050.0f;
@@ -118,52 +127,115 @@ static void applyWindow(uint8_t fx, uint8_t h, uint8_t s, uint8_t v, uint8_t spd
   }
 }
 
-// Download /clips/NNN.wav files 1..count from base_url
+// Asset Sync: to pivot radio for HTTP (Pizza_HouseNode.ino)
 static void doAssetSync(const AssetSyncPayload* ap){
   Serial.printf("[House %u] ASSET_SYNC start: url=\"%s\" count=%u\n",
                 g_houseId, ap->base_url, ap->count);
 
-  uint8_t okCount = 0; uint8_t code = 0;
+  uint8_t okCount = 0, code = 0;
 
   if (!LittleFS.begin()) LittleFS.begin(true);
   LittleFS.mkdir("/clips");
 
-  // Require Wi-Fi for HTTP
-  wl_status_t st = WiFi.status();
-  if (st != WL_CONNECTED) {
-    Serial.printf("[House %u] ASSET_SYNC aborted: WiFi not connected (status=%d)\n", g_houseId, (int)st);
-    code = 10;  // no wifi
-  } else {
-    for (uint8_t i=1; i<=ap->count; ++i){
-      char url[160]; snprintf(url, sizeof(url), "%s/%03u.wav", ap->base_url, (unsigned)i);
-      char path[32]; snprintf(path, sizeof(path), "/clips/%03u.wav", (unsigned)i);
+  // 1) Pause ESPNOW exactly like OTA
+  PizzaNow::deinit();
+  delay(50);
 
+  // 2) Join Wi-Fi using the exact OTA path
+  if (!PizzaOta::beginWifi(20000)) {
+    Serial.printf("[House %u] ASSET_SYNC WiFi connect failed\n", g_houseId);
+    code = 10;
+  } else {
+    // 3) HTTP client setup (same as OTA)
+    WiFiClient client; client.setTimeout(20000);
+    HTTPClient http;
+    http.setConnectTimeout(15000);
+    http.setTimeout(20000);
+    http.setReuse(false);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.useHTTP10(true);
+
+    // 4) Pull files 1..count
+    // download loop – skip 404s
+    okCount = 0;              // count of successfully fetched files
+    code    = 0;              // 0=all ok, 2=some missing/failed
+
+    for (uint8_t i = 1; i <= ap->count; ++i) {
+      char url[160];  snprintf(url,  sizeof(url),  "%s/%03u.wav", ap->base_url, (unsigned)i);
+      char path[32];  snprintf(path, sizeof(path), "/clips/%03u.wav", (unsigned)i);
       Serial.printf("[House %u] GET %s -> %s\n", g_houseId, url, path);
 
       HTTPClient http;
-      if (!http.begin(url)) { code = 1; Serial.println("[ASSET] http.begin failed"); break; }
+      WiFiClient client; client.setTimeout(20000);
+      http.setConnectTimeout(15000);
+      http.setTimeout(20000);
+      http.setReuse(false);
+      http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+      http.useHTTP10(true);
+
+      if (!http.begin(client, url)) {
+        Serial.println("[ASSET] http.begin failed – skipping");
+        code = 2;
+        http.end();
+        continue; // try next clip
+      }
+
       int rc = http.GET();
-      if (rc != HTTP_CODE_OK){ http.end(); code = 2; Serial.printf("[ASSET] HTTP rc=%d\n", rc); break; }
+      Serial.printf("[ASSET] HTTP GET -> %d\n", rc);
+      if (rc != HTTP_CODE_OK) {
+        // 404 etc: skip but keep going so later clips (e.g. 005) can still download
+        code = 2;
+        http.end();
+        continue;
+      }
 
       File f = LittleFS.open(path, FILE_WRITE);
-      if (!f) { http.end(); code = 3; Serial.println("[ASSET] open path failed"); break; }
+      if (!f) {
+        Serial.println("[ASSET] open path failed – skipping");
+        code = 2;
+        http.end();
+        continue;
+      }
 
       WiFiClient* s = http.getStreamPtr();
-      uint8_t buf[1024]; int r = 0; size_t total=0;
+      uint8_t buf[2048]; int r = 0; size_t total = 0;
       while ((r = s->readBytes((char*)buf, sizeof(buf))) > 0) { f.write(buf, r); total += r; }
-      f.close(); http.end();
+      f.close();
+      http.end();
+
       okCount++;
       Serial.printf("[House %u] WROTE %s (%u bytes)\n", g_houseId, path, (unsigned)total);
     }
+
+    // If some failed, leave code=2; success only if all fetched
+    // ar.ok will remain (okCount == ap->count)
   }
 
-  AssetResultPayload ar{};
-  ar.house_id = g_houseId; ar.ok = (okCount == ap->count) ? 1 : 0; ar.count_done = okCount; ar.code = code;
-  uint8_t out[64]; size_t n = PizzaProtocol::pack(ASSET_RESULT, (Role)PIZZA_ROLE, g_houseId, g_seq++, &ar, sizeof(ar), out, sizeof(out));
-  PizzaNow::sendBroadcast(out, n);
+  // 5) Leave Wi-Fi (OTA path), restore ESPNOW
+  PizzaOta::endWifi();
+  delay(30);
+  PizzaNow::begin(ESPNOW_CHANNEL);
+  PizzaNow::onReceive(onRx);
 
+  // 6) Report result to Central (over ESPNOW)
+  AssetResultPayload ar{};
+  ar.house_id   = g_houseId;
+  ar.ok         = (okCount == ap->count) ? 1 : 0;
+  ar.count_done = okCount;
+  ar.code       = code;
+
+  uint8_t out[64];
+  size_t n = PizzaProtocol::pack(ASSET_RESULT, (Role)PIZZA_ROLE, g_houseId, g_seq++, &ar, sizeof(ar), out, sizeof(out));
+  PizzaNow::sendBroadcast(out, n);
   Serial.printf("[House %u] ASSET_SYNC done: ok=%u count=%u code=%u\n",
                 g_houseId, ar.ok, ar.count_done, ar.code);
+
+  // 7) Reboot on success (mirrors OTA’s success behavior)
+  if (ar.ok) {
+    Serial.println("[House] ASSET_SYNC success → rebooting...");
+    delay(200);
+    ESP.restart();
+  }
 }
 
 static void sendHello() {
@@ -191,11 +263,11 @@ static void sendDeliverScan(const uint8_t* uid, uint8_t uidLen) {
 }
 
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t /*srcMac*/[6]) {
-  if (hdr.type == HELLO_REQ) { 
-    uint32_t jitter = 50 + (esp_random() % 300);           // 50..350 ms
-    g_helloDueAt = millis() + jitter + ((PIZZA_HOUSE_ID & 7) * 40);
+  if (hdr.type == HELLO_REQ) {
+    uint32_t jitter = 50 + (esp_random() % 300); // 50..350 ms
+    g_helloDueAt = millis() + jitter + ((g_houseId & 7) * 40);
     return;
-   }
+  }
 
   /*** onRx: delivery verdict from Central ***/
   if (hdr.type == DELIVER_RESULT && len >= sizeof(DeliverResultPayload)) {
@@ -220,10 +292,17 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
   if (hdr.type == SOUND_PLAY && len >= sizeof(SoundPlayPayload)) {
     const SoundPlayPayload* sp = (const SoundPlayPayload*)payload;
     if (sp->house_id == g_houseId) {
-      PizzaAudio::playClip(beepBuf, sizeof(beepBuf)/2, sp->vol ? sp->vol : 200);
-      g_fx = EFFECT_YELLOW_PING; g_fxUntil = millis() + 240; // short yellow ping
-      PZ_LOGI("SOUND_PLAY vol=%u", sp->vol);
+      uint8_t vol = sp->vol ? sp->vol : 200;
+      PizzaAudioFS::setVolume(vol);
+      if (!PizzaAudioFS::playClip(sp->clip_id, /*loop=*/false)) {
+        // Fallback: short in-RAM beep if file missing
+        PizzaAudio::playClip(beepBuf, sizeof(beepBuf)/2, vol);
+        Serial.printf("[House %u] SOUND_PLAY: missing /clips/%03u.wav, played beep\n", g_houseId, sp->clip_id);
+      }
+      g_fx = EFFECT_YELLOW_PING; g_fxUntil = millis() + 240;
+      PZ_LOGI("SOUND_PLAY clip=%u vol=%u", sp->clip_id, vol);
     }
+    return;
   }
 
   if (hdr.type == CLAIM && len >= sizeof(ClaimPayload)) {
@@ -269,12 +348,12 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       // Speaker (FS-based audio)
       if (p->flags & 0x04) {
         if (p->spk_flags & 0x02) {
-          // STOP
           PizzaAudioFS::stop();
         } else {
-          // PLAY
           PizzaAudioFS::setVolume(p->spk_vol);
-          PizzaAudioFS::playClip(p->spk_clip, (p->spk_flags & 0x01));
+          if (!PizzaAudioFS::playClip(p->spk_clip, (p->spk_flags & 0x01))) {
+            Serial.printf("[House %u] Missing /clips/%03u.wav – no audio\n", g_houseId, p->spk_clip);
+          }
         }
       }
     }
@@ -283,9 +362,16 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 
   if (hdr.type == ASSET_SYNC && len >= sizeof(AssetSyncPayload)) {
     const AssetSyncPayload* ap = (const AssetSyncPayload*)payload;
-    Serial.printf("[House %u] ASSET_SYNC rx for me (url=%s, count=%u)\n",
-              g_houseId, ap->base_url, ap->count);
-    if (ap->house_id == g_houseId) { doAssetSync(ap); }
+    if (ap->house_id == g_houseId) {
+      if (g_assetBusy || g_assetPending) {
+        Serial.printf("[House %u] ASSET_SYNC ignored (busy)\n", g_houseId);
+      } else {
+        memcpy((void*)&g_assetReq, ap, sizeof(AssetSyncPayload));
+        g_assetPending = true;          // signal main loop to perform sync
+        Serial.printf("[House %u] ASSET_SYNC queued (url=%s count=%u)\n",
+                      g_houseId, g_assetReq.base_url, g_assetReq.count);
+      }
+    }
     return;
   }
 
@@ -414,6 +500,23 @@ void loop() {
       }
       // success path reboots inside start()
     }
+  }
+
+  if (g_assetPending && !g_assetBusy) {
+    g_assetBusy = true; // lock
+
+    AssetSyncPayload req;
+    noInterrupts();
+    memcpy(&req, &g_assetReq, sizeof(req));
+    g_assetPending = false;
+    interrupts();
+
+    // stop audio before pivot to avoid I²S contention
+    PizzaAudioFS::stop();
+
+    doAssetSync(&req);
+
+    g_assetBusy = false; // unlock
   }
 
   /*** Delivery FSM tick ***/

@@ -775,7 +775,7 @@ void loop() {
       sendHouseDigital(id, /*flags*/0x01|0x04,
                       /*win*/WIN_FX_PARTY, 0,255,40, 140,
                       /*panel*/0, "", 0,0,0,
-                      /*spk*/5, 200, /*loop*/true, /*stop*/false);
+                      /*spk*/1, 200, /*loop*/true, /*stop*/false);
     } else if (mode == "stop") {
       // Turn window off + stop speaker (leave panel as-is)
       sendHouseDigital(id, /*flags*/0x01|0x04,
