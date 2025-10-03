@@ -122,6 +122,23 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     return;
   }
 
+  if (hdr.type == HOUSE_DIGITAL_SET && len >= sizeof(HouseDigitalSetPayload)) {
+    const HouseDigitalSetPayload* p = (const HouseDigitalSetPayload*)payload;
+    if (p->house_id != g_houseId) return;
+
+    if (p->flags & 0x02) {
+      if (p->panel_mode == PANEL_MODE_TEXT) {
+        PizzaPanel::showText(p->panel_text, p->panel_style, p->panel_speed, p->panel_bright);
+      } else if (p->panel_mode == PANEL_MODE_NUMBER) {
+        // numbers as static text (could add a big-digits mode later)
+        PizzaPanel::showText(p->panel_text, /*style*/1, /*speed*/1, p->panel_bright);
+      } else if (p->panel_mode == PANEL_MODE_LETTER) {
+        PizzaPanel::showText(p->panel_text, /*style*/1, /*speed*/1, p->panel_bright);
+      }
+    }
+    return;
+  }
+
   if (hdr.type == OTA_START && len >= sizeof(OtaStartPayload)) {
     const OtaStartPayload* p = (const OtaStartPayload*)payload;
     if (!matchOtaTarget(p)) return;

@@ -5,6 +5,7 @@
 
 #define PIZZA_ROLE CENTRAL
 #define PIZZA_HOUSE_ID 0
+#define PZ_HOUSES 6
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -30,6 +31,47 @@ static PzOrderItemSetPayload g_orders[PZ_ORDERS_MAX];
 static uint8_t g_orderCount = 0;
 static uint16_t g_seq_orders = 1;
 
+// Topping map 
+static const uint8_t kTopBits[5]  = {0x01, 0x02, 0x04, 0x08, 0x10};
+static const char*   kTopNames[5] = {"pepperoni","mushrooms","peppers","pineapple","ham"};
+
+// Orders pool + L1 generator
+static uint8_t g_housePool[7]; // indices 1..6 -> assigned numbers 1..99 (0 = not set)
+
+static void ordersAssignNumbers(uint32_t seed) {
+  randomSeed(seed);
+  uint8_t base = 1 + (random(0, 94)); // 1..94 so base..base+5 fits in 1..99
+  uint8_t nums[6];
+  for (int i=0;i<6;i++) nums[i] = base + i;
+
+  // Fisher–Yates shuffle
+  for (int i=5;i>0;i--) { int j = random(0, i+1); uint8_t t=nums[i]; nums[i]=nums[j]; nums[j]=t; }
+  for (int h=1; h<=6; ++h) g_housePool[h] = nums[h-1];
+
+  Serial.printf("orders: pool ->"); for (int h=1; h<=6; ++h) Serial.printf(" H%d=#%u", h, g_housePool[h]); Serial.println();
+}
+
+static void ordersShowPool() {
+  if (!g_housePool[1]) { Serial.println("orders: pool is empty (run `orders pool reset`)"); return; }
+  Serial.printf("orders: pool ->"); for (int h=1; h<=6; ++h) Serial.printf(" H%d=#%u", h, g_housePool[h]); Serial.println();
+}
+
+// Add 1 Level-1 order to your local list (returns false if list is full)
+static bool ordersGenLevel1() {
+  if (!g_housePool[1]) ordersAssignNumbers(esp_random()); // lazy-init
+  uint8_t targetHouse = 1 + (esp_random() % 6);  // 1..6
+  uint8_t topIdx      = (esp_random() % 5);      // 0..4
+  uint8_t mask        = kTopBits[topIdx];
+
+  char clue[96];
+  snprintf(clue, sizeof(clue), "Make a %s pizza for house #%u",
+           kTopNames[topIdx], g_housePool[targetHouse]);
+
+  bool ok = ordersAddLocal(targetHouse, mask, clue);
+  if (ok) Serial.printf("orders: gen1 -> H%u mask=0x%02X text=\"%s\"\n", targetHouse, mask, clue);
+  return ok;
+}
+
 static void ordersResetLocal() {
   g_orderCount = 0;
   for (uint8_t i=0;i<PZ_ORDERS_MAX;i++) {
@@ -51,7 +93,6 @@ static bool ordersAddLocal(uint8_t house_id, uint8_t mask, const char* text) {
   g_orderCount++;
   return true;
 }
-
 
 enum DeliverReason : uint8_t {
   DR_OK = 0,
@@ -260,6 +301,36 @@ static void ordersSendShowText(const char* s) {
   Serial.printf("[Central] ORDER_SHOW_TEXT len=%u\n", (unsigned)strlen(p.text));
 }
 
+static void sendHouseDigital(
+  uint8_t houseId, uint8_t flags,                // flags: b0=window, b1=panel, b2=speaker
+  // window
+  uint8_t fx, uint8_t h, uint8_t s, uint8_t v, uint8_t fxSpeed,
+  // panel
+  uint8_t panelMode, const char* panelText, uint8_t panelStyle, uint8_t panelSpeed, uint8_t panelBright,
+  // speaker
+  uint8_t clip, uint8_t vol, bool loop, bool stopNow
+){
+  HouseDigitalSetPayload p{};
+  p.house_id   = houseId;
+  p.flags      = (uint8_t)(flags & 0x07);
+
+  // Window payload (applied only if flags&0x01)
+  p.win_fx     = fx;   p.win_h = h; p.win_s = s; p.win_v = v; p.win_speed = fxSpeed;
+
+  // Panel payload (applied only if flags&0x02)
+  p.panel_mode  = panelMode;
+  if (panelText) { strlcpy(p.panel_text, panelText, sizeof(p.panel_text)); }
+  p.panel_style = panelStyle; p.panel_speed = panelSpeed; p.panel_bright = panelBright;
+
+  // Speaker payload (applied only if flags&0x04)
+  p.spk_clip   = clip; p.spk_vol = vol; p.spk_flags = (loop?1:0) | (stopNow?2:0);
+
+  uint8_t buf[256];
+  size_t n = PizzaProtocol::pack(HOUSE_DIGITAL_SET, CENTRAL, 0, g_seq++, &p, sizeof(p), buf, sizeof(buf));
+  PizzaNow::sendBroadcast(buf, n);
+  PZ_LOGI("HOUSE_DIGITAL_SET -> H%u flags=0x%02X", houseId, p.flags);
+}
+
 static Role parseRole(const String& s) {
   if (s=="HOUSE_PANEL") return HOUSE_PANEL;
   if (s=="HOUSE_NODE")  return HOUSE_NODE;
@@ -364,6 +435,13 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     else          { s.ok = 0; s.mask = 0; }
 
     sendIngrSnapshot(s);
+    return;
+  }
+
+  if (hdr.type == ASSET_RESULT && len >= sizeof(AssetResultPayload)) {
+    const AssetResultPayload* r = (const AssetResultPayload*)payload;
+    Serial.printf("[Central] ASSET_RESULT H%u ok=%u count=%u code=%u\n",
+                  r->house_id, r->ok, r->count_done, r->code);
     return;
   }
 
@@ -606,6 +684,11 @@ void loop() {
   if (line.startsWith("orders ")) {
     String rest = line.substring(7); rest.trim();
 
+    // New: number pool for houses (6 consecutive numbers 1..99)
+    if (rest == "pool reset") { ordersAssignNumbers(esp_random()); Serial.println("orders: pool reset"); return; }
+    if (rest == "pool show")  { ordersShowPool(); return; }
+
+    // Existing: reset/show/push
     if (rest == "reset") { ordersResetLocal(); Serial.println("orders: reset"); return; }
 
     if (rest == "show") {
@@ -619,7 +702,13 @@ void loop() {
 
     if (rest == "push") { ordersPushAll(); return; }
 
-    // orders add <house_id> <mask> "text..."
+    // New: auto-generate one Level-1 order and add to local list
+    if (rest == "gen1") {
+      if (!ordersGenLevel1()) Serial.println("orders: list full (max 6)");
+      return;
+    }
+
+    // Existing: orders add <house_id> <mask> "text..."
     if (rest.startsWith("add ")) {
       rest = rest.substring(4);
       int sp = rest.indexOf(' ');
@@ -650,7 +739,7 @@ void loop() {
       return;
     }
 
-    // orders showidx <n>  -> send text of item n to panel
+    // Existing: orders showidx <n>  -> send text of item n to panel
     if (rest.startsWith("showidx ")) {
       int n = rest.substring(8).toInt();
       if (n < 0 || n >= g_orderCount) { Serial.println("usage: orders showidx <0..count-1>"); return; }
@@ -658,7 +747,7 @@ void loop() {
       return;
     }
 
-    // orders show "text..." -> send arbitrary text to panel
+    // Existing: orders show "text..." -> send arbitrary text to panel
     if (rest.startsWith("show ")) {
       String txt = rest.substring(5); txt.trim();
       if (txt.length() && txt[0]=='"' && txt[txt.length()-1]=='"') {
@@ -668,7 +757,59 @@ void loop() {
       return;
     }
 
-    Serial.println("orders commands: reset | show | add <house> <mask> \"text\" | push");
+    Serial.println("orders commands: reset | show | push | add <house> <mask> \"text\" | showidx <n> | show \"text\" | pool reset | pool show | gen1");
+    return;
+  }
+
+  // scene <id> party | stop | number <digits>
+  if (line.startsWith("scene ")) {
+    // scene <id> party | stop | number <digits>
+    int s1 = line.indexOf(' '); if (s1<0) return;
+    String rest = line.substring(s1+1); rest.trim();
+    int s2 = rest.indexOf(' ');
+    uint8_t id = (uint8_t)((s2>0)? rest.substring(0,s2).toInt() : 1);
+    String mode = (s2>0)? rest.substring(s2+1) : String("party");
+
+    if (mode == "party") {
+      // Window + Speaker only (leave panel as-is)
+      sendHouseDigital(id, /*flags*/0x01|0x04,
+                      /*win*/WIN_FX_PARTY, 0,255,40, 140,
+                      /*panel*/0, "", 0,0,0,
+                      /*spk*/5, 200, /*loop*/true, /*stop*/false);
+    } else if (mode == "stop") {
+      // Turn window off + stop speaker (leave panel as-is)
+      sendHouseDigital(id, /*flags*/0x01|0x04,
+                      /*win*/WIN_FX_OFF, 0,0,0, 0,
+                      /*panel*/0, "", 0,0,0,
+                      /*spk*/0, 0, /*loop*/false, /*stop*/true);
+    } else if (mode.startsWith("number ")) {
+      String digits = mode.substring(7); digits.trim();
+      // Only set panel (leave window/speaker untouched)
+      sendHouseDigital(id, /*flags*/0x02,
+                      /*win*/0, 0,0,0, 0,
+                      /*panel*/PANEL_MODE_NUMBER, digits.c_str(), 1,1,180,
+                      /*spk*/0,0,false,false);
+    }
+    return;
+  }
+
+  // clips sync <id|all> <base_url> <count>
+  if (line.startsWith("clips sync ")) {
+    // clips sync 3 http://10.0.0.5/pizza/h3 12
+    String rest = line.substring(String("clips sync ").length()); rest.trim();
+    int sp1 = rest.indexOf(' '), sp2 = rest.indexOf(' ', sp1+1);
+    if (sp1<0 || sp2<0) { Serial.println(F("usage: clips sync <id> <base_url> <count>")); return; }
+
+    int id = rest.substring(0,sp1).toInt();
+    String base = rest.substring(sp1+1, sp2);
+    int count = rest.substring(sp2+1).toInt(); if (count < 1) count = 1; if (count > 30) count = 30;
+
+    AssetSyncPayload ap{}; ap.house_id = (uint8_t)id;
+    strlcpy(ap.base_url, base.c_str(), sizeof(ap.base_url)); ap.count = (uint8_t)count;
+
+    uint8_t out[192]; size_t n = PizzaProtocol::pack(ASSET_SYNC, CENTRAL, 0, g_seq++, &ap, sizeof(ap), out, sizeof(out));
+    PizzaNow::sendBroadcast(out, n);
+    Serial.printf("ASSET_SYNC -> id=%d url=%s count=%d\n", id, ap.base_url, ap.count);
     return;
   }
 

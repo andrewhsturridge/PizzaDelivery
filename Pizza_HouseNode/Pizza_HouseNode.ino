@@ -11,6 +11,9 @@
 #include <SPI.h>
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
+#include <FS.h>
+#include <LittleFS.h>
+#include <HTTPClient.h>
 
 #include "PizzaProtocol.h"
 #include "PizzaNow.h"
@@ -20,18 +23,24 @@
 #include "PizzaRfid.h"
 #include "PizzaAudio.h"
 #include "PizzaOta.h"
+#include "PizzaAudioFS.h"
 
 static uint16_t g_seq = 1;
 Preferences prefs;
 static uint8_t g_houseId = 0;  // runtime house id from NVS
 static uint32_t g_helloDueAt = 0;
 
-// --- Pins (House 1 mapping) ---
+// --- Pins (House mapping) ---
 static const uint8_t  PIN_WS2812 = 38;
 static const uint16_t LED_COUNT  = 90;
 static const uint8_t  RC522_CS   = 5;
 static const uint8_t  RC522_RST  = 11;
 static const uint8_t  SPI_SCK    = 36, SPI_MISO = 37, SPI_MOSI = 35;
+
+// Audio I2S pins on the House
+constexpr int I2S_BCLK = 43;   // example
+constexpr int I2S_LRCK = 44;   // example
+constexpr int I2S_DOUT = 12;   // example
 
 // --- OTA deferral ---
 static volatile bool g_otaPending = false;
@@ -64,6 +73,11 @@ static const uint32_t REMOVAL_STABLE_MS = 250;    // require stable absence
 static uint32_t g_stateDeadline = 0;
 static uint32_t g_absentSince  = 0;
 
+// window fx  state
+static uint8_t  g_winFx   = WIN_FX_OFF;
+static uint8_t  g_winH=0, g_winS=0, g_winV=0, g_winSpd=0;
+static uint32_t g_nextFxAt = 0;     // scheduling for rainbow/party
+
 static void fillBeep() {
   const float freq = 1000.0f, sr = 22050.0f;
   for (size_t i=0; i<sizeof(beepBuf)/sizeof(beepBuf[0]); ++i) {
@@ -71,6 +85,85 @@ static void fillBeep() {
     float s = sinf(2.0f*PI*freq*t);
     beepBuf[i] = (int16_t)(s * 16000); // ~-12 dBFS
   }
+}
+
+// Utility: tiny HSV→RGB for Adafruit_NeoPixel (0..255 each)
+static uint32_t hsv2rgb(uint8_t h, uint8_t s, uint8_t v){
+  // simple wheel: map h(0..255) to 0..1530 steps
+  uint16_t i = (uint16_t)h * 6; uint8_t f = (h * 6) & 0xFF;
+  uint8_t p = (uint16_t)v * (255 - s) / 255;
+  uint8_t q = (uint16_t)v * (255 - (uint16_t)s * f / 255) / 255;
+  uint8_t t = (uint16_t)v * (255 - (uint16_t)s * (255 - f) / 255) / 255;
+  uint8_t r,g,b;
+  switch (i>>8){
+    case 0: r=v; g=t; b=p; break; case 1: r=q; g=v; b=p; break;
+    case 2: r=p; g=v; b=t; break; case 3: r=p; g=q; b=v; break;
+    case 4: r=t; g=p; b=v; break; default: r=v; g=p; b=q; break;
+  }
+  return strip.Color(r,g,b);
+}
+
+// Apply window effect immediately (solid) or schedule (animated)
+static void applyWindow(uint8_t fx, uint8_t h, uint8_t s, uint8_t v, uint8_t spd){
+  g_winFx = fx; g_winH=h; g_winS=s; g_winV=v; g_winSpd=spd;
+  if (fx == WIN_FX_OFF){
+    strip.clear(); strip.show();
+  } else if (fx == WIN_FX_SOLID){
+    uint32_t c = hsv2rgb(h,s,v);
+    for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, c);
+    strip.show();
+  } else {
+    // animated modes tick in loop()
+    g_nextFxAt = 0;
+  }
+}
+
+// Download /clips/NNN.wav files 1..count from base_url
+static void doAssetSync(const AssetSyncPayload* ap){
+  Serial.printf("[House %u] ASSET_SYNC start: url=\"%s\" count=%u\n",
+                g_houseId, ap->base_url, ap->count);
+
+  uint8_t okCount = 0; uint8_t code = 0;
+
+  if (!LittleFS.begin()) LittleFS.begin(true);
+  LittleFS.mkdir("/clips");
+
+  // Require Wi-Fi for HTTP
+  wl_status_t st = WiFi.status();
+  if (st != WL_CONNECTED) {
+    Serial.printf("[House %u] ASSET_SYNC aborted: WiFi not connected (status=%d)\n", g_houseId, (int)st);
+    code = 10;  // no wifi
+  } else {
+    for (uint8_t i=1; i<=ap->count; ++i){
+      char url[160]; snprintf(url, sizeof(url), "%s/%03u.wav", ap->base_url, (unsigned)i);
+      char path[32]; snprintf(path, sizeof(path), "/clips/%03u.wav", (unsigned)i);
+
+      Serial.printf("[House %u] GET %s -> %s\n", g_houseId, url, path);
+
+      HTTPClient http;
+      if (!http.begin(url)) { code = 1; Serial.println("[ASSET] http.begin failed"); break; }
+      int rc = http.GET();
+      if (rc != HTTP_CODE_OK){ http.end(); code = 2; Serial.printf("[ASSET] HTTP rc=%d\n", rc); break; }
+
+      File f = LittleFS.open(path, FILE_WRITE);
+      if (!f) { http.end(); code = 3; Serial.println("[ASSET] open path failed"); break; }
+
+      WiFiClient* s = http.getStreamPtr();
+      uint8_t buf[1024]; int r = 0; size_t total=0;
+      while ((r = s->readBytes((char*)buf, sizeof(buf))) > 0) { f.write(buf, r); total += r; }
+      f.close(); http.end();
+      okCount++;
+      Serial.printf("[House %u] WROTE %s (%u bytes)\n", g_houseId, path, (unsigned)total);
+    }
+  }
+
+  AssetResultPayload ar{};
+  ar.house_id = g_houseId; ar.ok = (okCount == ap->count) ? 1 : 0; ar.count_done = okCount; ar.code = code;
+  uint8_t out[64]; size_t n = PizzaProtocol::pack(ASSET_RESULT, (Role)PIZZA_ROLE, g_houseId, g_seq++, &ar, sizeof(ar), out, sizeof(out));
+  PizzaNow::sendBroadcast(out, n);
+
+  Serial.printf("[House %u] ASSET_SYNC done: ok=%u count=%u code=%u\n",
+                g_houseId, ar.ok, ar.count_done, ar.code);
 }
 
 static void sendHello() {
@@ -165,6 +258,37 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     return;
   }
 
+  if (hdr.type == HOUSE_DIGITAL_SET && len >= sizeof(HouseDigitalSetPayload)) {
+    const HouseDigitalSetPayload* p = (const HouseDigitalSetPayload*)payload;
+    if (p->house_id == g_houseId) {
+      // Window LEDs
+      if (p->flags & 0x01) {
+        applyWindow(p->win_fx, p->win_h, p->win_s, p->win_v, p->win_speed);
+      }
+
+      // Speaker (FS-based audio)
+      if (p->flags & 0x04) {
+        if (p->spk_flags & 0x02) {
+          // STOP
+          PizzaAudioFS::stop();
+        } else {
+          // PLAY
+          PizzaAudioFS::setVolume(p->spk_vol);
+          PizzaAudioFS::playClip(p->spk_clip, (p->spk_flags & 0x01));
+        }
+      }
+    }
+    return;
+  }
+
+  if (hdr.type == ASSET_SYNC && len >= sizeof(AssetSyncPayload)) {
+    const AssetSyncPayload* ap = (const AssetSyncPayload*)payload;
+    Serial.printf("[House %u] ASSET_SYNC rx for me (url=%s, count=%u)\n",
+              g_houseId, ap->base_url, ap->count);
+    if (ap->house_id == g_houseId) { doAssetSync(ap); }
+    return;
+  }
+
 }
 
 static void cfgLoad() {
@@ -256,11 +380,15 @@ void setup() {
   if (!PizzaAudio::beginI2S()) { PZ_LOGE("I2S init failed"); }
   delay(10);
 
+  PizzaAudioFS::begin(I2S_BCLK, I2S_LRCK, I2S_DOUT);
+  PizzaAudioFS::setVolume(200); // 0..255
+
   PZ_LOGI("Node init complete");
 }
 
 void loop() {
   PizzaNow::loop();
+  PizzaAudioFS::loop();
 
   if (g_helloDueAt && (int32_t)(millis() - g_helloDueAt) >= 0) {
     sendHello();
@@ -337,6 +465,7 @@ void loop() {
 
   // LED effects (no heartbeat; idle = off)
   uint32_t now = millis();
+
   switch (g_fx) {
     case EFFECT_OK_PULSE:
       if (now <= g_fxUntil) {
@@ -363,6 +492,28 @@ void loop() {
     default:
       // stay off
       break;
+  }
+
+  if (g_winFx == WIN_FX_RAINBOW) {
+    if ((int32_t)(now - g_nextFxAt) >= 0) {
+      static uint8_t hue = 0; hue += (g_winSpd? g_winSpd : 4);
+      for (uint16_t i=0;i<LED_COUNT;i++){
+        uint8_t h = hue + (i*3);
+        strip.setPixelColor(i, hsv2rgb(h, g_winS?g_winS:255, g_winV?g_winV:120));
+      }
+      strip.show();
+      g_nextFxAt = now + 30;
+    }
+  } else if (g_winFx == WIN_FX_PARTY) {
+    if ((int32_t)(now - g_nextFxAt) >= 0) {
+      for (uint16_t i=0;i<LED_COUNT;i++){
+        uint8_t h = (uint8_t)esp_random();
+        strip.setPixelColor(i, hsv2rgb(h, 200, g_winV?g_winV:120));
+      }
+      strip.show();
+      uint16_t pace = 40 + (255 - g_winSpd); // faster with higher speed
+      g_nextFxAt = now + pace;
+    }
   }
 
   delay(1); // cooperative yield
