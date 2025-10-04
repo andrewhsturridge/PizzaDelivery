@@ -9,6 +9,8 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Preferences.h>
+
 #include "PizzaProtocol.h"
 #include "PizzaNow.h"
 #include "PizzaIdentity.h"
@@ -16,6 +18,7 @@
 #include "BuildConfig.h"
 
 static uint16_t g_seq = 1;
+static Preferences s_prefsBoxes;
 
 /*** Block A: GLOBAL STATE + HELPERS ***/
 static const uint8_t MASK_NONE = 0xFF;      // "no order set"
@@ -37,23 +40,46 @@ static const char*   kTopNames[5] = {"pepperoni","mushrooms","peppers","pineappl
 
 // Orders pool + L1 generator
 static uint8_t g_housePool[7]; // indices 1..6 -> assigned numbers 1..99 (0 = not set)
+static bool g_autoNextL1 = true;
+
+// Box whitelist
+struct BoxUID { uint8_t len; uint8_t uid[10]; bool set; };
+static BoxUID g_box[6];
+static int8_t g_learnSlot = 0;  // 1..6 means “capture next scan into this slot”
 
 static void ordersAssignNumbers(uint32_t seed) {
   randomSeed(seed);
-  uint8_t base = 1 + (random(0, 94)); // 1..94 so base..base+5 fits in 1..99
-  uint8_t nums[6];
-  for (int i=0;i<6;i++) nums[i] = base + i;
+  // Pick a base so base..base+5 ⊆ [1..99]
+  uint8_t base = 1 + (random(0, 94)); // 1..94
 
-  // Fisher–Yates shuffle
-  for (int i=5;i>0;i--) { int j = random(0, i+1); uint8_t t=nums[i]; nums[i]=nums[j]; nums[j]=t; }
-  for (int h=1; h<=6; ++h) g_housePool[h] = nums[h-1];
+  // Disperse in this exact order: H1, H6, H2, H5, H3, H4
+  const uint8_t houseOrder[6] = {1, 6, 2, 5, 3, 4};
+  for (int i = 0; i < 6; ++i) {
+    uint8_t h = houseOrder[i];
+    g_housePool[h] = base + i;
+  }
 
-  Serial.printf("orders: pool ->"); for (int h=1; h<=6; ++h) Serial.printf(" H%d=#%u", h, g_housePool[h]); Serial.println();
+  Serial.printf("orders: pool ->");
+  for (int h=1; h<=6; ++h) Serial.printf(" H%d=#%u", h, g_housePool[h]);
+  Serial.println();
 }
 
 static void ordersShowPool() {
   if (!g_housePool[1]) { Serial.println("orders: pool is empty (run `orders pool reset`)"); return; }
   Serial.printf("orders: pool ->"); for (int h=1; h<=6; ++h) Serial.printf(" H%d=#%u", h, g_housePool[h]); Serial.println();
+}
+
+static void housesNumbersShow() {
+  if (!g_housePool[1]) { Serial.println("houses: pool empty; run `orders pool reset` first"); return; }
+  for (uint8_t h=1; h<=6; ++h) {
+    char digits[8]; snprintf(digits, sizeof(digits), "%u", (unsigned)g_housePool[h]);
+    // Panel only (flags=0x02). NOTE: 5 window fields -> 0,0,0,0,0
+    sendHouseDigital(h, /*flags*/0x02,
+                     /*win*/0,0,0,0,0,
+                     /*panel*/PANEL_MODE_NUMBER, digits, 1,1,180,
+                     /*spk*/0,0,false,false);
+  }
+  Serial.println("houses: numbers pushed to panels");
 }
 
 // Add 1 Level-1 order to your local list (returns false if list is full)
@@ -92,6 +118,38 @@ static bool ordersAddLocal(uint8_t house_id, uint8_t mask, const char* text) {
   if (text && *text) strncpy(it.text, text, sizeof(it.text)-1);
   g_orderCount++;
   return true;
+}
+
+static void ordersRemoveByHouse(uint8_t h){
+  for (uint8_t i=0; i<g_orderCount; ) {
+    if (g_orders[i].house_id == h) {
+      for (uint8_t j=i+1; j<g_orderCount; ++j) { g_orders[j-1] = g_orders[j]; g_orders[j-1].index = j-1; }
+      --g_orderCount;
+    } else {
+      ++i;
+    }
+  }
+}
+
+// Called on DR_OK
+static void onDeliveredOk(uint8_t houseId){
+  // 1) Remove delivered order(s) and disarm validator for that house
+  ordersRemoveByHouse(houseId);
+  g_orderMask[houseId] = MASK_NONE;
+
+  // 2) Optionally auto-create next L1 and ARM it
+  if (g_autoNextL1) {
+    if (ordersGenLevel1()) {
+      const auto &it = g_orders[g_orderCount-1];
+      g_orderMask[it.house_id] = it.mask;   // ARM for new order
+      Serial.printf("orders: auto-next -> armed H%u mask=0x%02X\n", it.house_id, it.mask);
+    } else {
+      Serial.println("orders: auto-next skipped (list full)");
+    }
+  }
+
+  // 3) SINGLE push after all changes
+  ordersPushAll();
 }
 
 enum DeliverReason : uint8_t {
@@ -134,6 +192,20 @@ static void tagUpsert(const uint8_t* uid, uint8_t len, uint8_t mask) {
   g_tags[idx].ts   = millis();
 }
 
+static void ingrClearTag(const uint8_t* uid, uint8_t uidLen) {
+  int idx = tagFind(uid, uidLen);
+  if (idx >= 0) {
+    g_tags[idx].mask = 0;                 // ingredients cleared
+    g_tags[idx].ts   = millis();
+  }
+  PizzaIngrSnapshotPayload sp{};
+  sp.uid_len = uidLen;
+  memcpy(sp.uid, uid, uidLen);
+  sp.ok   = 1;
+  sp.mask = 0;                            // broadcast "now empty"
+  sendIngrSnapshot(sp);
+}
+
 static void printMask(uint8_t m) {
   if (m == MASK_NONE) { Serial.print(F("(none)")); return; }
   Serial.print(F("0x")); if (m < 16) Serial.print('0'); Serial.print(m, HEX);
@@ -144,6 +216,87 @@ static void printMask(uint8_t m) {
   Serial.print((m &  8) ? 'i' : '.'); // Pineapple
   Serial.print((m & 16) ? 'H' : '.'); // Ham
   Serial.print(']');
+}
+
+// Box whitelist
+static bool uidEq(const uint8_t* a, uint8_t alen, const uint8_t* b, uint8_t blen){
+  if (alen != blen) return false;
+  return memcmp(a, b, alen) == 0;
+}
+
+static bool isWhitelisted(const uint8_t* uid, uint8_t len){
+  for (int i=0;i<6;i++) if (g_box[i].set && uidEq(uid, len, g_box[i].uid, g_box[i].len)) return true;
+  return false;
+}
+
+static void boxesShow(){
+  Serial.println("boxes:");
+  for (int i=0;i<6;i++){
+    Serial.printf("  %d: ", i+1);
+    if (!g_box[i].set) { Serial.println("(empty)"); continue; }
+    for (uint8_t k=0;k<g_box[i].len;k++){ if (g_box[i].uid[k]<16) Serial.print('0'); Serial.print(g_box[i].uid[k], HEX); if (k+1<g_box[i].len) Serial.print(':'); }
+    Serial.println();
+  }
+}
+
+static void boxesClear(int idx /*1..6 or 0 for all*/){
+  if (idx==0){ for (int i=0;i<6;i++){ g_box[i].set=false; g_box[i].len=0; } }
+  else if (idx>=1 && idx<=6){ g_box[idx-1].set=false; g_box[idx-1].len=0; }
+}
+
+static bool parseUidHex(const String& s, uint8_t out[10], uint8_t &len){
+  // Accept "04:A1:B2:C3" or "04A1B2C3"
+  String t = s; t.toUpperCase(); String clean;
+  for (char c: t) if ((c>='0'&&c<='9')||(c>='A'&&c<='F')) clean += c;
+  if (clean.length()<8 || clean.length()>20 || (clean.length()&1)) return false;
+  len = (uint8_t)(clean.length()/2);
+  for (uint8_t i=0;i<len;i++){ char b[3]={clean[2*i], clean[2*i+1],0}; out[i]=(uint8_t)strtol(b,nullptr,16); }
+  return true;
+}
+
+// Packed form for NVS
+struct BoxStore {
+  uint8_t len;
+  uint8_t uid[10];
+  uint8_t set;
+  uint8_t _pad;                   // align to 12 bytes each (optional)
+};
+
+static void boxesSave(){
+  BoxStore a[6] = {};
+  for (int i=0;i<6;i++){
+    a[i].len = g_box[i].len;
+    a[i].set = g_box[i].set ? 1 : 0;
+    memset(a[i].uid, 0, sizeof(a[i].uid));
+    if (g_box[i].len && g_box[i].len <= 10) {
+      memcpy(a[i].uid, g_box[i].uid, g_box[i].len);
+    }
+  }
+  s_prefsBoxes.begin("central", false);   // NVS namespace for Central
+  s_prefsBoxes.putBytes("boxes", a, sizeof(a));
+  s_prefsBoxes.end();
+  Serial.println("boxes: saved to NVS");
+}
+
+static void boxesLoad(){
+  BoxStore a[6] = {};
+  s_prefsBoxes.begin("central", true);
+  size_t got = s_prefsBoxes.getBytes("boxes", a, sizeof(a));
+  s_prefsBoxes.end();
+
+  if (got == sizeof(a)) {
+    for (int i=0;i<6;i++){
+      g_box[i].len = a[i].len;
+      g_box[i].set = (a[i].set != 0);
+      if (g_box[i].len > 10) g_box[i].len = 0;
+      if (g_box[i].len) memcpy(g_box[i].uid, a[i].uid, g_box[i].len);
+    }
+    Serial.println("boxes: loaded from NVS");
+  } else {
+    // Nothing stored yet → leave empty
+    for (int i=0;i<6;i++){ g_box[i].set=false; g_box[i].len=0; }
+    Serial.println("boxes: NVS empty");
+  }
 }
 
 // -------------------- ROSTER --------------------
@@ -382,8 +535,12 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
   /*** Block B: onRx – PIZZA_ING_UPDATE -> remember uid→mask ***/
   if (hdr.type == PIZZA_ING_UPDATE && len >= sizeof(PizzaIngrUpdatePayload)) {
     const PizzaIngrUpdatePayload* u = (const PizzaIngrUpdatePayload*)payload;
+    if (!isWhitelisted(u->uid, u->uid_len)) {
+      Serial.println("[Central] ING_UPDATE ignored: UID not whitelisted");
+      return;
+    }
     Serial.printf("[Central] ING_UPDATE from id=%u mask=0x%02X\n", hdr.house_id, u->mask);
-    // Payload is expected to provide u->uid (bytes), u->uid_len, u->mask
+    // Remember uid->mask for validation later
     tagUpsert(u->uid, u->uid_len, u->mask);
     return;
   }
@@ -398,17 +555,42 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
   /*** Block C: onRx – DELIVER_SCAN -> validate against order & cache ***/
   if (hdr.type == DELIVER_SCAN && len >= sizeof(DeliverScanPayload)) {
     const DeliverScanPayload* s = (const DeliverScanPayload*)payload;
-    // Payload is expected to provide s->house_id, s->uid (bytes), s->uid_len
+
+    // Optional learn mode (you kept this — good)
+    if (g_learnSlot >= 1 && g_learnSlot <= 6) {
+      g_box[g_learnSlot-1].len = s->uid_len;
+      memcpy(g_box[g_learnSlot-1].uid, s->uid, s->uid_len);
+      g_box[g_learnSlot-1].set = true;
+      Serial.printf("boxes: learned slot %d -> ", g_learnSlot);
+      for (uint8_t k=0;k<s->uid_len;k++){ if (s->uid[k]<16) Serial.print('0'); Serial.print(s->uid[k], HEX); if (k+1<s->uid_len) Serial.print(':'); }
+      Serial.println();
+      g_learnSlot = 0;
+      boxesSave();
+      // continue to normal validation
+    }
+
     uint8_t reason = DR_OK;
     uint8_t order  = g_orderMask[s->house_id];
-    int idx = tagFind(s->uid, s->uid_len);
 
-    if (idx < 0)                    reason = DR_UNKNOWN_PIZZA; // never saw this UID
-    else if (order == MASK_NONE)    reason = DR_NO_ORDER;      // no order set for that house
-    else if (g_tags[idx].mask != order) reason = DR_WRONG_PIZZA; // wrong toppings
+    // 1) must be whitelisted
+    if (!isWhitelisted(s->uid, s->uid_len)) {
+      reason = DR_UNKNOWN_PIZZA;
+    } else {
+      // 2) must have ingredient mask cached
+      int idx = tagFind(s->uid, s->uid_len);
+      if (idx < 0)                      reason = DR_UNKNOWN_PIZZA;
+      else if (order == MASK_NONE)      reason = DR_NO_ORDER;
+      else if (g_tags[idx].mask != order) reason = DR_WRONG_PIZZA;
+    }
 
-    // Central tells the House if it’s ok + why
+    // Tell the house the verdict
     sendDeliverResult(s->house_id, (reason == DR_OK), reason);
+
+    // On success: clear that box’s ingredients and trigger auto-next flow
+    if (reason == DR_OK) {
+      ingrClearTag(s->uid, s->uid_len);     // <— clear toppings + broadcast snapshot
+      onDeliveredOk(s->house_id);           // <— remove order, maybe create+arm next
+    }
     return;
   }
 
@@ -520,6 +702,7 @@ void setup() {
   PizzaNow::onReceive(onRx);
 
   stateInit();
+  boxesLoad();
 
   // Help
   Serial.println(F("Type 'help' for commands."));
@@ -685,7 +868,12 @@ void loop() {
     String rest = line.substring(7); rest.trim();
 
     // New: number pool for houses (6 consecutive numbers 1..99)
-    if (rest == "pool reset") { ordersAssignNumbers(esp_random()); Serial.println("orders: pool reset"); return; }
+    if (rest == "pool reset") {
+      ordersAssignNumbers(esp_random());
+      Serial.println("orders: pool reset");
+      housesNumbersShow();              // <— push digits to panels automatically
+      return;
+    }
     if (rest == "pool show")  { ordersShowPool(); return; }
 
     // Existing: reset/show/push
@@ -704,7 +892,19 @@ void loop() {
 
     // New: auto-generate one Level-1 order and add to local list
     if (rest == "gen1") {
-      if (!ordersGenLevel1()) Serial.println("orders: list full (max 6)");
+      if (!ordersGenLevel1()) { Serial.println("orders: list full (max 6)"); return; }
+
+      // Arm the per-house validator for this order
+      const auto &it = g_orders[g_orderCount-1];
+      g_orderMask[it.house_id] = it.mask;
+
+      // Push list to Orders Node/Panel; Order Station UI handles display
+      ordersPushAll();
+
+      // Optional: ensure panels are showing the numbers (safe to resend)
+      housesNumbersShow();
+
+      Serial.printf("orders: armed H%u with mask=0x%02X; clue in list\n", it.house_id, it.mask);
       return;
     }
 
@@ -754,6 +954,13 @@ void loop() {
         txt = txt.substring(1, txt.length()-1);
       }
       ordersSendShowText(txt.c_str());
+      return;
+    }
+
+    if (rest.startsWith("auto ")) {
+      String v = rest.substring(5); v.trim();
+      g_autoNextL1 = (v == "on");
+      Serial.printf("orders auto-next L1 = %s\n", g_autoNextL1 ? "ON" : "OFF");
       return;
     }
 
@@ -812,5 +1019,46 @@ void loop() {
     Serial.printf("ASSET_SYNC -> id=%d url=%s count=%d\n", id, ap.base_url, ap.count);
     return;
   }
+
+  // boxes show
+  if (line == "boxes show"){ boxesShow(); return; }
+
+  // boxes clear            -> clear all
+  // boxes clear <n>        -> clear one slot (1..6)
+  if (line.startsWith("boxes clear")){
+    String rest = line.substring(11); rest.trim();
+    int slot = rest.length()? rest.toInt() : 0;
+    boxesClear(slot);
+    Serial.println("boxes: cleared");
+    boxesSave();
+    return;
+  }
+
+  // boxes set <n> <uidHex>
+  if (line.startsWith("boxes set ")){
+    String rest = line.substring(10); rest.trim();
+    int sp = rest.indexOf(' ');
+    if (sp<0){ Serial.println("usage: boxes set <1..6> <UIDhex>"); return; }
+    int slot = rest.substring(0,sp).toInt();
+    String hex = rest.substring(sp+1); hex.trim();
+    if (slot<1||slot>6){ Serial.println("usage: boxes set <1..6> <UIDhex>"); return; }
+    uint8_t buf[10], len=0;
+    if (!parseUidHex(hex, buf, len)){ Serial.println("boxes set: bad UID"); return; }
+    g_box[slot-1].set=true; g_box[slot-1].len=len; memcpy(g_box[slot-1].uid, buf, len);
+    Serial.printf("boxes: set slot %d\n", slot);
+    boxesSave();
+    return;
+  }
+
+  // boxes learn <n>   -> next scanned tag will populate slot n
+  if (line.startsWith("boxes learn ")){
+    int slot = line.substring(12).toInt();
+    if (slot<1||slot>6){ Serial.println("usage: boxes learn <1..6>"); return; }
+    g_learnSlot = slot;
+    Serial.printf("boxes: learning slot %d (scan a pizza box tag once)\n", slot);
+    return;
+  }
+
+  if (line == "boxes reload"){ boxesLoad(); boxesShow(); return; }
 
 }
