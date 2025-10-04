@@ -42,10 +42,142 @@ static const char*   kTopNames[5] = {"pepperoni","mushrooms","peppers","pineappl
 static uint8_t g_housePool[7]; // indices 1..6 -> assigned numbers 1..99 (0 = not set)
 static bool g_autoNextL1 = true;
 
+// Enums for physical facts
+enum HHouseColor : uint8_t { HC_RED=0, HC_YELLOW=1, HC_BLUE=2 };
+enum HDoorColor  : uint8_t { DC_BROWN=0, DC_WHITE=1,  DC_GREY=2 };
+enum HHandleShape: uint8_t { HS_ROUND=0, HS_BAR=1 };
+enum HHandleColor: uint8_t { HCOL_SILVER=0, HCOL_GOLD=1 };
+
+// Index by house id [1..6]
+static uint8_t g_fact_houseColor[7] = {0, HC_RED,    HC_BLUE,   HC_YELLOW, HC_RED,    HC_YELLOW, HC_BLUE};
+static uint8_t g_fact_doorColor [7] = {0, DC_GREY,   DC_WHITE,  DC_BROWN,  DC_BROWN,  DC_WHITE,  DC_GREY};
+static uint8_t g_fact_handleShape[7]= {0, HS_ROUND,  HS_ROUND,  HS_BAR,    HS_ROUND,  HS_ROUND,  HS_ROUND};
+static uint8_t g_fact_handleColor[7]= {0, HCOL_SILVER,HCOL_SILVER,HCOL_SILVER,HCOL_GOLD,HCOL_GOLD,HCOL_GOLD};
+
+// "Beside" (same-side neighbors), 0 if none
+static uint8_t g_adj_left [3] = {1,2,3}; // left wall, increasing
+static uint8_t g_adj_right[3] = {6,5,4}; // right wall, decreasing
+// Precomputed immediate neighbors (beside)
+static uint8_t g_besideA[7] = {0, 2, 1, 2, 5, 6, 5}; // first neighbor
+static uint8_t g_besideB[7] = {0, 0, 3, 0, 0, 4, 0}; // second neighbor (if any)
+
+// "Across"
+static uint8_t g_across[7] = {0, 6, 5, 4, 3, 2, 1};
+
 // Box whitelist
 struct BoxUID { uint8_t len; uint8_t uid[10]; bool set; };
 static BoxUID g_box[6];
 static int8_t g_learnSlot = 0;  // 1..6 means “capture next scan into this slot”
+
+///// Game Manager (state + config) /////
+enum GamePhase : uint8_t { GP_IDLE=0, GP_RUNNING=1, GP_OVER=2 };
+struct GameState {
+  GamePhase phase;
+  uint8_t   level;         // 1..5
+  uint16_t  targetOK;      // how many OK deliveries to "complete" a level
+  bool      autoAdvance;   // if true, auto level-up when targetOK reached
+  uint16_t  okTotal;       // across all levels
+  uint16_t  okLevel;       // within current level
+  uint32_t  score;         // simple: +100 per OK * level
+  uint32_t  durationMs;    // game length
+  uint32_t  startedAt;     // millis()
+  uint32_t  endsAt;        // startedAt + durationMs
+} g_game = { GP_IDLE, 1, /*targetOK*/6, /*autoAdvance*/false, 0,0,0, /*duration*/180000, 0,0 };
+
+static uint32_t g_gameTickDueAt = 0;
+
+// Helpers
+static void gameResetOrdersAndMasks(){
+  ordersResetLocal();
+  for (int i=0;i<256;i++) g_orderMask[i] = MASK_NONE;
+}
+
+static void gamePrintStatus(){
+  uint32_t now = millis();
+  int32_t remaining = (g_game.phase==GP_RUNNING)? (int32_t)(g_game.endsAt - now) : 0;
+  Serial.printf("game: phase=%s level=%u score=%lu okLevel=%u/%u okTotal=%u timeLeft=%ldms\n",
+    (g_game.phase==GP_IDLE?"IDLE":(g_game.phase==GP_RUNNING?"RUNNING":"OVER")),
+    g_game.level, (unsigned long)g_game.score, g_game.okLevel, g_game.targetOK, g_game.okTotal, (long)remaining);
+}
+
+static void gameStart(uint16_t minutes, uint8_t level){
+  if (minutes==0) minutes = 3;
+  if (level==0)   level = 1;
+  g_game.phase = GP_RUNNING;
+  g_game.level = level;
+  g_game.okLevel = 0;
+  g_game.okTotal = 0;
+  g_game.score   = 0;
+  g_game.durationMs = (uint32_t)minutes * 60UL * 1000UL;
+  g_game.startedAt  = millis();
+  g_game.endsAt     = g_game.startedAt + g_game.durationMs;
+
+  // fresh numbers + panels, fresh list, create first L1
+  ordersAssignNumbers(esp_random());
+  housesNumbersShow();
+  gameResetOrdersAndMasks();
+
+  // one Level-1 order armed and pushed; your OrderStation handles display
+  if (ordersGenLevel1()) {
+    const auto &it = g_orders[g_orderCount-1];
+    g_orderMask[it.house_id] = it.mask;
+  }
+  ordersPushAll();
+
+  // L1 auto-next stays on so an order is always available
+  g_autoNextL1 = true;
+
+  g_gameTickDueAt = millis() + 200; // start ticking
+  Serial.println("game: START");
+  gamePrintStatus();
+}
+
+static void gameStop(){
+  if (g_game.phase == GP_IDLE) return;
+  g_game.phase = GP_OVER;
+  // Clear list; OrderStation will show "NO ORDERS"
+  gameResetOrdersAndMasks();
+  ordersPushAll();
+  Serial.println("game: STOP");
+  gamePrintStatus();
+}
+
+static void gameNextLevel(){
+  if (g_game.phase != GP_RUNNING) return;
+  g_game.level++;
+  g_game.okLevel = 0;
+  // reset list and seed one order for the new level (for now: still L1 generator)
+  gameResetOrdersAndMasks();
+  if (ordersGenLevel1()) {
+    const auto &it = g_orders[g_orderCount-1];
+    g_orderMask[it.house_id] = it.mask;
+  }
+  ordersPushAll();
+  Serial.printf("game: NEXT -> level=%u\n", g_game.level);
+  gamePrintStatus();
+}
+
+static void gameOnOk(uint8_t /*houseId*/){
+  if (g_game.phase != GP_RUNNING) return;
+  g_game.okTotal++;
+  g_game.okLevel++;
+  g_game.score += (uint32_t)(100 * g_game.level);
+  // Auto-advance if enabled and target reached
+  if (g_game.autoAdvance && g_game.okLevel >= g_game.targetOK) {
+    gameNextLevel();
+  }
+}
+
+static void gameTick(){
+  uint32_t now = millis();
+  if ((int32_t)(now - g_gameTickDueAt) < 0) return;
+  g_gameTickDueAt = now + 200; // 5 Hz is plenty
+
+  if (g_game.phase == GP_RUNNING && (int32_t)(now - g_game.endsAt) >= 0) {
+    Serial.println("game: TIME UP");
+    gameStop();
+  }
+}
 
 static void ordersAssignNumbers(uint32_t seed) {
   randomSeed(seed);
@@ -216,6 +348,21 @@ static void printMask(uint8_t m) {
   Serial.print((m &  8) ? 'i' : '.'); // Pineapple
   Serial.print((m & 16) ? 'H' : '.'); // Ham
   Serial.print(']');
+}
+
+// Handy printer
+static void factsShow(){
+  auto hc=[](uint8_t c){ return (c==HC_RED?"red":(c==HC_YELLOW?"yellow":"blue")); };
+  auto dc=[](uint8_t c){ return (c==DC_BROWN?"brown":(c==DC_WHITE?"white":"grey")); };
+  auto hs=[](uint8_t s){ return (s==HS_ROUND?"round":"bar"); };
+  auto hk=[](uint8_t c){ return (c==HCOL_SILVER?"silver":"gold"); };
+  for (uint8_t h=1; h<=6; ++h){
+    Serial.printf("H%u: house=%s door=%s handle=%s/%s beside={%u%s%s} across=%u\n",
+      h, hc(g_fact_houseColor[h]), dc(g_fact_doorColor[h]),
+      hs(g_fact_handleShape[h]), hk(g_fact_handleColor[h]),
+      g_besideA[h], (g_besideB[h]? ",":""),
+      (g_besideB[h]? String(g_besideB[h]).c_str():""), g_across[h]);
+  }
 }
 
 // Box whitelist
@@ -589,6 +736,7 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     // On success: clear that box’s ingredients and trigger auto-next flow
     if (reason == DR_OK) {
       ingrClearTag(s->uid, s->uid_len);     // <— clear toppings + broadcast snapshot
+      gameOnOk(s->house_id);                // <— score/level counters
       onDeliveredOk(s->house_id);           // <— remove order, maybe create+arm next
     }
     return;
@@ -710,6 +858,8 @@ void setup() {
 
 void loop() {
   PizzaNow::loop();
+
+  gameTick();
 
   String line = readLine();
   if (!line.length()) return;
@@ -1060,5 +1210,31 @@ void loop() {
   }
 
   if (line == "boxes reload"){ boxesLoad(); boxesShow(); return; }
+  if (line == "facts show"){ factsShow(); return; }
+
+  // game start [minutes] [level]
+  if (line.startsWith("game start")){
+    String rest = line.substring(10); rest.trim();
+    int minutes = 3, lvl = 1;
+    if (rest.length()){
+      int sp = rest.indexOf(' ');
+      if (sp<0) { minutes = rest.toInt(); }
+      else { minutes = rest.substring(0,sp).toInt(); lvl = rest.substring(sp+1).toInt(); }
+    }
+    if (minutes <= 0) minutes = 3;
+    if (lvl <= 0)     lvl = 1;
+    gameStart((uint16_t)minutes, (uint8_t)lvl);
+    return;
+  }
+  if (line == "game stop"){ gameStop(); return; }
+  if (line == "game status"){ gamePrintStatus(); return; }
+  // game next  -> advance to next level (manual)
+  if (line == "game next"){ gameNextLevel(); return; }
+  // game target <n>  -> how many OKs to consider a level "complete"
+  if (line.startsWith("game target ")){ int n=line.substring(12).toInt(); if (n>0 && n<99) g_game.targetOK=n; gamePrintStatus(); return; }
+  // game auto on|off -> auto advance level when target reached
+  if (line.startsWith("game auto ")){ String v=line.substring(10); v.trim(); g_game.autoAdvance=(v=="on"); gamePrintStatus(); return; }
+  // game minutes <n> -> change duration for next start
+  if (line.startsWith("game minutes ")){ int m=line.substring(13).toInt(); if (m>0) g_game.durationMs=(uint32_t)m*60UL*1000UL; return; }
 
 }
