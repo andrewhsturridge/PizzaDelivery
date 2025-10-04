@@ -628,20 +628,14 @@ static void ordersPushAll() {
 static void ordersPushWindow(uint8_t maxDisplay) {
   uint8_t window = (g_orderCount < maxDisplay) ? g_orderCount : maxDisplay;
 
-  // 1) RESET with the window size
   ordersSendReset(window);
-  delay(8); // tiny gap helps reliability over ESP-NOW
+  delay(8); // small gap helps on ESPNOW
 
-  // 2) Send windowed items with REBASED indices 0..window-1
   for (uint8_t i = 0; i < window; ++i) {
-    PzOrderItemSetPayload it = g_orders[i]; // take the first 'window' items in current order
-    it.index = i;                            // <— REBASE index for the 0..(window-1) view
+    PzOrderItemSetPayload it = g_orders[i]; // take first 'window' items
+    it.index = i;                            // <— REBASE indices to 0..window-1
     ordersSendItem(it);
     delay(6);
-    #if defined(PZ_ORDERS_DOUBLE_SEND) && PZ_ORDERS_DOUBLE_SEND
-      ordersSendItem(it);
-      delay(6);
-    #endif
   }
   Serial.printf("[Central] Pushed window=%u of total=%u\n", window, g_orderCount);
 }
@@ -796,15 +790,6 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       gameOnOk(s->house_id);                // <— score/level counters
       onDeliveredOk(s->house_id);           // <— remove order, maybe create+arm next
     }
-    return;
-  }
-
-  if (hdr.type == PIZZA_ING_UPDATE && len >= sizeof(PizzaIngrUpdatePayload)) {
-    const PizzaIngrUpdatePayload* u = (const PizzaIngrUpdatePayload*)payload;
-    PZ_LOGI("ING_UPDATE from id=%u mask=0x%02X (P=%d M=%d Pe=%d Pi=%d H=%d)",
-            hdr.house_id, u->mask,
-            !!(u->mask&1), !!(u->mask&2), !!(u->mask&4), !!(u->mask&8), !!(u->mask&16));
-    // TODO: store uid->mask in a small map so deliveries can be validated later.
     return;
   }
 
@@ -1095,7 +1080,7 @@ void loop() {
       return;
     }
 
-    if (rest == "push") { ordersPushAll(); return; }
+    if (rest == "push") { ordersPushWindow(3); return; }
 
     // New: auto-generate one Level-1 order and add to local list
     if (rest == "gen1") {
