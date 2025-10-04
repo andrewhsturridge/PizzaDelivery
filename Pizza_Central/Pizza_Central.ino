@@ -93,6 +93,9 @@ static uint32_t g_gameTickDueAt = 0;
 static const uint8_t L1_SEED_ORDERS = 3;
 static const uint8_t L1_GEN_CAP     = 6;   // stop generating after the 6th order
 
+///// forward declarations /////
+static void ordersPushWindow(uint8_t maxDisplay = 3);
+
 // Helpers
 static void gameResetOrdersAndMasks(){
   ordersResetLocal();
@@ -135,7 +138,7 @@ static void gameStart(uint16_t minutes, uint8_t level){
 
   // Arm validators for ALL seeded orders and push once
   armAllOrdersFromLocal();
-  ordersPushAll();
+  ordersPushWindow(3);
 
   // Keep L1 auto-next on; capped by genLevel vs L1_GEN_CAP
   g_autoNextL1 = true;
@@ -307,7 +310,7 @@ static void onDeliveredOk(uint8_t houseId){
 
   // 3) Arm ALL current orders and push ONCE
   armAllOrdersFromLocal();
-  ordersPushAll();
+  ordersPushWindow(3);
 }
 
 enum DeliverReason : uint8_t {
@@ -620,6 +623,27 @@ static void ordersPushAll() {
     ordersSendItem(g_orders[i]);
     delay(6); // 4–10 ms is enough in practice
   }
+}
+
+static void ordersPushWindow(uint8_t maxDisplay) {
+  uint8_t window = (g_orderCount < maxDisplay) ? g_orderCount : maxDisplay;
+
+  // 1) RESET with the window size
+  ordersSendReset(window);
+  delay(8); // tiny gap helps reliability over ESP-NOW
+
+  // 2) Send windowed items with REBASED indices 0..window-1
+  for (uint8_t i = 0; i < window; ++i) {
+    PzOrderItemSetPayload it = g_orders[i]; // take the first 'window' items in current order
+    it.index = i;                            // <— REBASE index for the 0..(window-1) view
+    ordersSendItem(it);
+    delay(6);
+    #if defined(PZ_ORDERS_DOUBLE_SEND) && PZ_ORDERS_DOUBLE_SEND
+      ordersSendItem(it);
+      delay(6);
+    #endif
+  }
+  Serial.printf("[Central] Pushed window=%u of total=%u\n", window, g_orderCount);
 }
 
 /*** CENTRAL: send ORDER_SHOW_TEXT directly to the panel ***/

@@ -278,7 +278,7 @@ void loop(){
   PizzaNow::loop();
 
   // Adjust read for your wiring: LOW if active-low button, HIGH if active-high
-  bool pressed = (digitalRead(BUTTON_PIN) == LOW);
+  bool pressed = (digitalRead(BTN_PIN) == LOW);
 
   // Watchdog: if still assembling after timeout, finalize with what we have
   if (g_oExpected > 0 && !g_oReady) {
