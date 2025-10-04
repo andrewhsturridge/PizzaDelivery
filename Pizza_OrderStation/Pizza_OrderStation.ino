@@ -31,21 +31,6 @@ static Adafruit_NeoPixel neopixelRing(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NE
 static uint16_t g_seq = 1;
 static uint32_t g_helloDueAt = 0;
 
-// Orders list
-static uint8_t g_expected = 0;
-static uint8_t g_count    = 0;
-static uint8_t g_index    = 0;
-static PzOrderItemSetPayload g_items[PZ_ORDERS_MAX];
-
-// Dedup / anti-spam
-static char     g_lastSent[PZ_ORDER_TEXT_MAX] = {0};
-static uint32_t g_lastSentAt = 0;
-static const uint32_t RESEND_MIN_MS = 5000; // don't resend identical text more often than this
-
-// Debounce
-static bool     g_lastRaw = true, g_btn = true;
-static uint32_t g_lastEdgeMs = 0;
-
 // OTA deferral
 static volatile bool g_otaPending = false;
 static char g_otaUrl[160] = {0};
@@ -56,6 +41,25 @@ static volatile size_t otaDone  = 0;
 static volatile size_t otaTotal = 0;
 static volatile bool   otaActive = false;
 
+///// Orders list state (ORDERS_NODE) /////
+struct LocalOrder {
+  bool     used;
+  uint8_t  house_id;
+  uint8_t  mask;
+  char     text[120];
+};
+
+static LocalOrder g_olist[6];
+static uint8_t    g_oExpected = 0;     // how many items Central said we'll get
+static uint8_t    g_oHave     = 0;     // how many unique indices we’ve stored
+static bool       g_oReady    = false; // list complete
+static int8_t     g_oCur      = -1;    // current shown index, -1 if none
+static uint16_t   g_oResetSeq = 0;     // seq of last ORDER_LIST_RESET we accepted
+
+///// assembly watchdog /////
+static uint32_t g_oResetAtMs = 0;
+static const uint16_t ORDER_ASSEMBLY_TIMEOUT_MS = 500; // ms; tune 300–800 if you like
+
 // ---------- helpers ----------
 static void sendHello(){
   HelloPayload hp{}; strlcpy(hp.fw, PizzaIdentity::fw(), sizeof(hp.fw));
@@ -64,48 +68,41 @@ static void sendHello(){
   PizzaNow::sendBroadcast(out, n); PZ_LOGI("HELLO sent (orders-node)");
 }
 
-static void sendShowText(const char* s, bool force=false){
-  const char* safe = (s && *s) ? s : "NO ORDERS";
-
-  // STRICT DEDUPE: if text is identical, do nothing unless forced
-  if (!force && strncmp(g_lastSent, safe, sizeof(g_lastSent)) == 0) {
-    return;
-  }
-
-  PzOrderShowTextPayload p{}; strlcpy(p.text, safe, sizeof(p.text));
-
-  uint8_t buf[256];
-  size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, (Role)PIZZA_ROLE, 0, g_seq++, &p, sizeof(p), buf, sizeof(buf));
-  PizzaNow::sendBroadcast(buf, n);
-
-  strlcpy(g_lastSent, safe, sizeof(g_lastSent));
-  g_lastSentAt = millis();   // keep if you also use time-based suppression elsewhere
-  Serial.printf("[OrdersNode] ORDER_SHOW_TEXT len=%u\n", (unsigned)strlen(p.text));
-}
-
 static void showNoOrders() {
-  sendShowText("NO ORDERS");
+  ordersSendShowText_Node(nullptr);
 }
 
-static void showCurrent(bool force=false) {
-  if (g_count == 0) { showNoOrders(); return; }
-  if (g_index >= g_count) g_index = 0;
-  sendShowText(g_items[g_index].text, force);
+// Panel bridge: send ORDER_SHOW_TEXT to Orders Panel(s)
+static void ordersSendShowText_Node(const char* s) {
+  PzOrderShowTextPayload p{};
+  if (s && *s) strlcpy(p.text, s, sizeof(p.text));
+  else         strcpy(p.text, "NO ORDERS");
+  uint8_t out[192];
+  size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, ORDERS_NODE, 0, g_seq++, &p, sizeof(p), out, sizeof(out));
+  PizzaNow::sendBroadcast(out, n);
 }
 
-static void clearItems() {
-  for (uint8_t i=0;i<PZ_ORDERS_MAX;i++){
-    g_items[i].index=i; g_items[i].house_id=0; g_items[i].mask=0; memset(g_items[i].text,0,sizeof(g_items[i].text));
-  }
+// Clear local list
+static void ordersLocalClear(){
+  for (auto &it : g_olist) it = LocalOrder{};
+  g_oExpected = 0; g_oHave = 0; g_oReady = false; g_oCur = -1;
 }
 
-static void recomputeCountContiguous() {
-  uint8_t c = 0;
-  for (uint8_t i=0;i<g_expected;i++){
-    if (g_items[i].text[0] == 0) break;
-    c = i + 1;
-  }
-  g_count = c;
+// Show by index
+static void ordersShowIndex(int idx){
+  if (idx < 0 || idx >= (int)g_oExpected || !g_olist[idx].used) return;
+  g_oCur = idx;
+  ordersSendShowText_Node(g_olist[idx].text);
+}
+
+// Debounced button edge (call this every loop with your raw button level)
+static bool ordersButtonEdge(bool pressed){
+  static uint8_t  st=0, last=0;
+  static uint32_t tStable=0;
+  if (pressed != last){ last = pressed; tStable = millis(); }
+  if ((int32_t)(millis()-tStable) < 20) return false;  // 20ms debounce
+  if (st != pressed){ st = pressed; if (st) return true; } // rising edge
+  return false;
 }
 
 // ---------- Neopixel helpers ----------
@@ -186,43 +183,62 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     return;
    }
 
-  if (hdr.type == ORDER_LIST_RESET && len >= sizeof(PzOrderListResetPayload)){
-    const auto* p = (const PzOrderListResetPayload*)payload;
-    g_expected = min<uint8_t>(p->count, PZ_ORDERS_MAX);
-    clearItems();
-    g_count = 0; g_index = 0;
-    Serial.printf("[OrdersNode] RESET expect=%u\n", g_expected);
-    if (g_expected == 0) showNoOrders();
+  if (hdr.type == ORDER_LIST_RESET && len >= sizeof(PzOrderListResetPayload)) {
+    const PzOrderListResetPayload* r = (const PzOrderListResetPayload*)payload;
+
+    ordersLocalClear();
+    g_oExpected = (r->count > 6) ? 6 : r->count;
+    g_oResetSeq = hdr.seq;
+    g_oResetAtMs = millis();       // <-- start assembly window
+    PZ_LOGI("ORDERS reset: expect=%u seq=%u", g_oExpected, g_oResetSeq);
+
+    if (g_oExpected == 0) {
+      ordersSendShowText_Node(nullptr); // "NO ORDERS"
+    }
     return;
   }
 
-  if (hdr.type == ORDER_ITEM_SET && len >= sizeof(PzOrderItemSetPayload)){
-    const auto* p = (const PzOrderItemSetPayload*)payload;
-    if (p->index < PZ_ORDERS_MAX && p->index < g_expected){
-      uint8_t oldCount = g_count;
-      g_items[p->index] = *p;
-      recomputeCountContiguous();
+  if (hdr.type == ORDER_ITEM_SET && len >= sizeof(PzOrderItemSetPayload)) {
+    const PzOrderItemSetPayload* it = (const PzOrderItemSetPayload*)payload;
 
-      // If list grew from 0 -> >0, start at first item immediately
-      if (oldCount == 0 && g_count > 0) {
-        g_index = 0;
-        showCurrent(/*force*/true); // ensure first draw
-        return;
-      }
+    // Ignore items if we haven't seen a RESET yet
+    if (g_oExpected == 0 && g_oResetSeq == 0) return;
 
-      // If current index went out of range (list shrank), clamp & show
-      if (g_count == 0) {
-        showNoOrders(); return;
-      }
-      if (g_index >= g_count) {
-        g_index = 0; showCurrent(/*force*/true); return;
-      }
-
-      // If the item we are displaying was updated, refresh the panel (dedup guards inside)
-      if (p->index == g_index) {
-        showCurrent();
-      }
+    // (Optional) ignore items clearly older than most recent RESET (if you use seq wrap, drop this)
+    if (hdr.seq < g_oResetSeq) {
+      PZ_LOGI("ORDERS item ignored (older seq)");
+      return;
     }
+
+    if (it->index >= g_oExpected) {
+      PZ_LOGI("ORDERS item out of range idx=%u >= %u", it->index, g_oExpected);
+      return;
+    }
+
+    LocalOrder &slot = g_olist[it->index];
+    if (!slot.used) {
+      g_oHave++;
+      slot.used     = true;
+      slot.house_id = it->house_id;
+      slot.mask     = it->mask;
+      memset(slot.text, 0, sizeof(slot.text));
+      strlcpy(slot.text, it->text, sizeof(slot.text));
+    } else {
+      // refresh (rare)
+      slot.house_id = it->house_id;
+      slot.mask     = it->mask;
+      strlcpy(slot.text, it->text, sizeof(slot.text));
+    }
+
+    // When complete, mark ready and show the first valid index exactly once
+    if (!g_oReady && g_oHave >= g_oExpected) {
+      g_oReady = true;
+      // find the first used index
+      int first = -1;
+      for (uint8_t i=0;i<g_oExpected;i++) if (g_olist[i].used){ first = i; break; }
+      if (first >= 0) ordersShowIndex(first);
+    }
+
     return;
   }
 
@@ -261,6 +277,47 @@ void setup(){
 void loop(){
   PizzaNow::loop();
 
+  // Adjust read for your wiring: LOW if active-low button, HIGH if active-high
+  bool pressed = (digitalRead(BUTTON_PIN) == LOW);
+
+  // Watchdog: if still assembling after timeout, finalize with what we have
+  if (g_oExpected > 0 && !g_oReady) {
+    if ((int32_t)(millis() - g_oResetAtMs) > (int32_t)ORDER_ASSEMBLY_TIMEOUT_MS) {
+      g_oReady = true;
+      // If we got something, show first; else show NO ORDERS (rare)
+      if (g_oHave > 0) {
+        int first = -1;
+        for (uint8_t i=0;i<g_oExpected;i++) if (g_olist[i].used){ first = i; break; }
+        if (first >= 0) ordersShowIndex(first);
+      } else {
+        ordersSendShowText_Node(nullptr);
+      }
+    }
+  }
+
+  if (ordersButtonEdge(pressed)) {
+    digitalWrite(LAMP_PIN, LOW);
+    delay(60);
+    digitalWrite(LAMP_PIN, HIGH);
+    if (g_oReady && g_oExpected > 0) {
+      // normal cycling among used slots
+      for (uint8_t step=1; step<=g_oExpected; ++step) {
+        int idx = ( (g_oCur < 0 ? 0 : g_oCur + step) % g_oExpected );
+        if (g_olist[idx].used) { ordersShowIndex(idx); break; }
+      }
+    } else {
+      // Not "ready" yet — graceful fallback:
+      if (g_oHave > 0) {
+        // show the first item we already have
+        int first = -1;
+        for (uint8_t i=0;i<g_oExpected;i++) if (g_olist[i].used){ first = i; break; }
+        if (first >= 0) ordersShowIndex(first);
+      } else if (g_oExpected == 0) {
+        ordersSendShowText_Node(nullptr);
+      }
+    }
+  }
+
   if (g_helloDueAt && (int32_t)(millis() - g_helloDueAt) >= 0) {
     sendHello();
     g_helloDueAt = 0;
@@ -278,24 +335,6 @@ void loop(){
         OtaResultPayload rr{}; rr.ok=0; rr.code=(uint8_t)res;
         uint8_t out[64]; size_t n = PizzaProtocol::pack(OTA_RESULT, (Role)PIZZA_ROLE, PIZZA_HOUSE_ID, g_seq++, &rr, sizeof(rr), out, sizeof(out));
         PizzaNow::sendBroadcast(out, n);
-      }
-    }
-  }
-
-  // Button: manual next (still supported)
-  bool raw = digitalRead(BTN_PIN);
-  if (raw != g_lastRaw){ g_lastRaw=raw; g_lastEdgeMs=millis(); }
-  if (millis() - g_lastEdgeMs > 35){
-    if (raw != g_btn){
-      g_btn = raw;
-      if (g_btn == LOW){
-        digitalWrite(LAMP_PIN, LOW); delay(60); digitalWrite(LAMP_PIN, HIGH);
-        if (g_count > 0){
-          g_index = (g_index + 1) % g_count;
-          showCurrent(/*force*/true);
-        } else {
-          showNoOrders();
-        }
       }
     }
   }

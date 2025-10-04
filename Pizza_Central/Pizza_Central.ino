@@ -74,17 +74,24 @@ enum GamePhase : uint8_t { GP_IDLE=0, GP_RUNNING=1, GP_OVER=2 };
 struct GameState {
   GamePhase phase;
   uint8_t   level;         // 1..5
-  uint16_t  targetOK;      // how many OK deliveries to "complete" a level
-  bool      autoAdvance;   // if true, auto level-up when targetOK reached
+  uint16_t  targetOK;      // OK deliveries to "complete" a level (optional)
+  bool      autoAdvance;   // auto level-up when targetOK reached
   uint16_t  okTotal;       // across all levels
   uint16_t  okLevel;       // within current level
-  uint32_t  score;         // simple: +100 per OK * level
+  uint32_t  score;         // +100 * level per OK
   uint32_t  durationMs;    // game length
   uint32_t  startedAt;     // millis()
   uint32_t  endsAt;        // startedAt + durationMs
-} g_game = { GP_IDLE, 1, /*targetOK*/6, /*autoAdvance*/false, 0,0,0, /*duration*/180000, 0,0 };
+  uint16_t  genLevel;      // NEW: how many orders generated this level
+} g_game = { GP_IDLE, 1, /*targetOK*/6, /*autoAdv*/false,
+             0,0,0, /*duration*/180000, 0,0,
+             /*genLevel*/0 };
 
 static uint32_t g_gameTickDueAt = 0;
+
+// Level 1 config
+static const uint8_t L1_SEED_ORDERS = 3;
+static const uint8_t L1_GEN_CAP     = 6;   // stop generating after the 6th order
 
 // Helpers
 static void gameResetOrdersAndMasks(){
@@ -111,23 +118,29 @@ static void gameStart(uint16_t minutes, uint8_t level){
   g_game.durationMs = (uint32_t)minutes * 60UL * 1000UL;
   g_game.startedAt  = millis();
   g_game.endsAt     = g_game.startedAt + g_game.durationMs;
+  g_game.genLevel   = 0;
 
-  // fresh numbers + panels, fresh list, create first L1
+  // Fresh numbers + panels
   ordersAssignNumbers(esp_random());
   housesNumbersShow();
-  gameResetOrdersAndMasks();
 
-  // one Level-1 order armed and pushed; your OrderStation handles display
-  if (ordersGenLevel1()) {
-    const auto &it = g_orders[g_orderCount-1];
-    g_orderMask[it.house_id] = it.mask;
+  // Fresh list + masks
+  ordersResetLocal();
+
+  // Seed orders: L1 -> 3, otherwise 1
+  uint8_t seeds = (g_game.level==1 ? L1_SEED_ORDERS : 1);
+  for (uint8_t i=0; i<seeds; ++i) {
+    if (ordersGenLevel1()) ++g_game.genLevel;
   }
+
+  // Arm validators for ALL seeded orders and push once
+  armAllOrdersFromLocal();
   ordersPushAll();
 
-  // L1 auto-next stays on so an order is always available
+  // Keep L1 auto-next on; capped by genLevel vs L1_GEN_CAP
   g_autoNextL1 = true;
 
-  g_gameTickDueAt = millis() + 200; // start ticking
+  g_gameTickDueAt = millis() + 200;
   Serial.println("game: START");
   gamePrintStatus();
 }
@@ -222,7 +235,7 @@ static bool ordersGenLevel1() {
   uint8_t mask        = kTopBits[topIdx];
 
   char clue[96];
-  snprintf(clue, sizeof(clue), "Make a %s pizza for house #%u",
+  snprintf(clue, sizeof(clue), "%s pizza for house #%u",
            kTopNames[topIdx], g_housePool[targetHouse]);
 
   bool ok = ordersAddLocal(targetHouse, mask, clue);
@@ -252,6 +265,15 @@ static bool ordersAddLocal(uint8_t house_id, uint8_t mask, const char* text) {
   return true;
 }
 
+// Set per-house validator masks from current local order list
+static void armAllOrdersFromLocal(){
+  for (int i=0; i<256; ++i) g_orderMask[i] = MASK_NONE;
+  for (uint8_t i=0; i<g_orderCount; ++i) {
+    const auto &it = g_orders[i];
+    g_orderMask[it.house_id] = it.mask;   // last one for a house wins if duplicates
+  }
+}
+
 static void ordersRemoveByHouse(uint8_t h){
   for (uint8_t i=0; i<g_orderCount; ) {
     if (g_orders[i].house_id == h) {
@@ -265,22 +287,26 @@ static void ordersRemoveByHouse(uint8_t h){
 
 // Called on DR_OK
 static void onDeliveredOk(uint8_t houseId){
-  // 1) Remove delivered order(s) and disarm validator for that house
+  // 1) Remove delivered order(s) and disarm that house
   ordersRemoveByHouse(houseId);
   g_orderMask[houseId] = MASK_NONE;
 
-  // 2) Optionally auto-create next L1 and ARM it
+  // 2) Optionally auto-create next order (L1 capped at 6 total generated)
   if (g_autoNextL1) {
-    if (ordersGenLevel1()) {
-      const auto &it = g_orders[g_orderCount-1];
-      g_orderMask[it.house_id] = it.mask;   // ARM for new order
-      Serial.printf("orders: auto-next -> armed H%u mask=0x%02X\n", it.house_id, it.mask);
+    bool added = false;
+    if (g_game.level == 1) {
+      if (g_game.genLevel < L1_GEN_CAP) {
+        if (ordersGenLevel1()) { ++g_game.genLevel; added = true; }
+      }
     } else {
-      Serial.println("orders: auto-next skipped (list full)");
+      // future levels can choose their own generator; keep L1 for now
+      if (ordersGenLevel1()) added = true;
     }
+    (void)added;
   }
 
-  // 3) SINGLE push after all changes
+  // 3) Arm ALL current orders and push ONCE
+  armAllOrdersFromLocal();
   ordersPushAll();
 }
 
@@ -585,8 +611,15 @@ static void ordersSendItem(const PzOrderItemSetPayload& item) {
 
 /*** CENTRAL: push local list to the Orders Node(s) ***/
 static void ordersPushAll() {
+  // 1) RESET
   ordersSendReset(g_orderCount);
-  for (uint8_t i=0;i<g_orderCount;i++) ordersSendItem(g_orders[i]);
+  delay(8); // small gap helps ESPNOW
+
+  // 2) ITEMS, with a tiny gap; optionally retransmit each once
+  for (uint8_t i = 0; i < g_orderCount; ++i) {
+    ordersSendItem(g_orders[i]);
+    delay(6); // 4–10 ms is enough in practice
+  }
 }
 
 /*** CENTRAL: send ORDER_SHOW_TEXT directly to the panel ***/
