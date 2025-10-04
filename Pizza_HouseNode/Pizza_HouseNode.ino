@@ -84,8 +84,18 @@ static uint8_t  g_winFx   = WIN_FX_OFF;
 static uint8_t  g_winH=0, g_winS=0, g_winV=0, g_winSpd=0;
 static uint32_t g_nextFxAt = 0;     // scheduling for rainbow/party
 
+static TaskHandle_t g_audioTask = nullptr;
+
 // Forward declares
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t srcMac[6]);
+
+static void audioTask(void*){
+  // High-ish priority, very lightweight loop
+  for(;;){
+    PizzaAudioFS::loop();
+    vTaskDelay(1); // ~1ms yield keeps buffers happy
+  }
+}
 
 static void fillBeep() {
   const float freq = 1000.0f, sr = 22050.0f;
@@ -279,10 +289,15 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 
       if (g_lastOk) {
         g_fx = EFFECT_OK_PULSE; g_fxUntil = millis() + 600;
-        PizzaAudio::playClip(beepBuf, sizeof(beepBuf)/2, 255);
+        // If you want a success chirp from FS, put a small file at /clips/090.wav and uncomment:
+        // PizzaAudioFS::setVolume(180);
+        // PizzaAudioFS::playClip(90, /*loop=*/false);
         PZ_LOGI("DELIVER_RESULT OK");
       } else {
         g_fx = EFFECT_ERR_PULSE; g_fxUntil = millis() + 600;
+        // Optional error chirp (/clips/091.wav):
+        // PizzaAudioFS::setVolume(160);
+        // PizzaAudioFS::playClip(91, /*loop=*/false);
         PZ_LOGI("DELIVER_RESULT ERR reason=%u", r->reason);
       }
     }
@@ -295,9 +310,7 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       uint8_t vol = sp->vol ? sp->vol : 200;
       PizzaAudioFS::setVolume(vol);
       if (!PizzaAudioFS::playClip(sp->clip_id, /*loop=*/false)) {
-        // Fallback: short in-RAM beep if file missing
-        PizzaAudio::playClip(beepBuf, sizeof(beepBuf)/2, vol);
-        Serial.printf("[House %u] SOUND_PLAY: missing /clips/%03u.wav, played beep\n", g_houseId, sp->clip_id);
+        Serial.printf("[House %u] SOUND_PLAY: missing /clips/%03u.wav\n", g_houseId, sp->clip_id);
       }
       g_fx = EFFECT_YELLOW_PING; g_fxUntil = millis() + 240;
       PZ_LOGI("SOUND_PLAY clip=%u vol=%u", sp->clip_id, vol);
@@ -462,19 +475,16 @@ void setup() {
   delay(10);
 
   // AUDIO last
-  fillBeep();
-  if (!PizzaAudio::beginI2S()) { PZ_LOGE("I2S init failed"); }
-  delay(10);
-
   PizzaAudioFS::begin(I2S_BCLK, I2S_LRCK, I2S_DOUT);
-  PizzaAudioFS::setVolume(200); // 0..255
+  PizzaAudioFS::setVolume(180);
+  // run audio loop on the other core so it’s always serviced
+  xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, 3, &g_audioTask, 0);
 
   PZ_LOGI("Node init complete");
 }
 
 void loop() {
   PizzaNow::loop();
-  PizzaAudioFS::loop();
 
   if (g_helloDueAt && (int32_t)(millis() - g_helloDueAt) >= 0) {
     sendHello();
@@ -604,7 +614,7 @@ void loop() {
         uint8_t h = hue + (i*3);
         strip.setPixelColor(i, hsv2rgb(h, g_winS?g_winS:255, g_winV?g_winV:120));
       }
-      strip.show();
+      strip.show(); PizzaAudioFS::loop();
       g_nextFxAt = now + 30;
     }
   } else if (g_winFx == WIN_FX_PARTY) {
@@ -613,7 +623,7 @@ void loop() {
         uint8_t h = (uint8_t)esp_random();
         strip.setPixelColor(i, hsv2rgb(h, 200, g_winV?g_winV:120));
       }
-      strip.show();
+      strip.show(); PizzaAudioFS::loop();
       uint16_t pace = 40 + (255 - g_winSpd); // faster with higher speed
       g_nextFxAt = now + pace;
     }
