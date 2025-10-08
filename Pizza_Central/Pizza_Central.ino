@@ -93,8 +93,23 @@ static uint32_t g_gameTickDueAt = 0;
 static const uint8_t L1_SEED_ORDERS = 3;
 static const uint8_t L1_GEN_CAP     = 6;   // stop generating after the 6th order
 
+// --- Orders window DRIP scheduler (Central) ---
+static uint32_t ORD_DRIP_GAP_RESET_MS = 15;  // gap after RESET
+static uint32_t ORD_DRIP_GAP_ITEM_MS  = 12;  // gap between ITEM sends
+static uint32_t ORD_DRIP_START_DELAY_MS = 60; // optional delay after verdict/snapshot
+
+struct OrdersDrip {
+  bool     active;
+  uint8_t  window;     // how many items to send (0..3)
+  uint8_t  idx;        // current item index 0..window-1
+  uint8_t  stage;      // 0=send RESET, 1=send item[idx] pass1, 2=pass2, 3=advance idx
+  uint32_t dueAt;      // next action time
+};
+static OrdersDrip s_ordersDrip = {false,0,0,0,0};
+
 ///// forward declarations /////
 static void ordersPushWindow(uint8_t maxDisplay = 3);
+static void ordersPushWindowDripStart(uint8_t maxDisplay, uint16_t startDelayMs = 0);
 
 // Helpers
 static void gameResetOrdersAndMasks(){
@@ -138,7 +153,7 @@ static void gameStart(uint16_t minutes, uint8_t level){
 
   // Arm validators for ALL seeded orders and push once
   armAllOrdersFromLocal();
-  ordersPushWindow(3);
+  ordersPushWindowDripStart(3 /*max*/, 0 /*start delay*/);
 
   // Keep L1 auto-next on; capped by genLevel vs L1_GEN_CAP
   g_autoNextL1 = true;
@@ -193,6 +208,64 @@ static void gameTick(){
     Serial.println("game: TIME UP");
     gameStop();
   }
+}
+
+// Start a scheduled push of the current window (up to maxDisplay)
+static void ordersPushWindowDripStart(uint8_t maxDisplay, uint16_t startDelayMs) {
+  uint8_t win = (g_orderCount < maxDisplay) ? g_orderCount : maxDisplay;
+
+  s_ordersDrip.active = true;
+  s_ordersDrip.window = win;
+  s_ordersDrip.idx    = 0;
+  s_ordersDrip.stage  = 0;                       // send RESET first
+  s_ordersDrip.dueAt  = millis() + startDelayMs; // small pause after verdicts
+  Serial.printf("[central] DRIP start: window=%u delay=%ums\n", win, (unsigned)startDelayMs);
+}
+
+static void ordersPushWindowDripTick() {
+  if (!s_ordersDrip.active) return;
+  if ((int32_t)(millis() - s_ordersDrip.dueAt) < 0) return;
+
+  if (s_ordersDrip.stage == 0) {
+    // RESET
+    ordersSendReset(s_ordersDrip.window);
+    s_ordersDrip.stage = 1;
+    s_ordersDrip.dueAt = millis() + ORD_DRIP_GAP_RESET_MS;
+    return;
+  }
+
+  // Done?
+  if (s_ordersDrip.idx >= s_ordersDrip.window) {
+    s_ordersDrip.active = false;
+    Serial.println("[central] DRIP done");
+    return;
+  }
+
+  // Prepare the current item (rebase index 0..window-1)
+  PzOrderItemSetPayload it = g_orders[s_ordersDrip.idx];
+  it.index = s_ordersDrip.idx;
+
+  if (s_ordersDrip.stage == 1) {
+    // First send of this item
+    ordersSendItem(it);
+    s_ordersDrip.stage = 2;
+    s_ordersDrip.dueAt = millis() + ORD_DRIP_GAP_ITEM_MS;
+    return;
+  }
+
+  if (s_ordersDrip.stage == 2) {
+    // Second send (covers occasional drop)
+    ordersSendItem(it);
+    s_ordersDrip.stage = 3;
+    s_ordersDrip.dueAt = millis() + ORD_DRIP_GAP_ITEM_MS;
+    return;
+  }
+
+  // stage 3: advance to next item
+  s_ordersDrip.idx++;
+  s_ordersDrip.stage = 1;
+  // immediate next item send allowed (no extra delay), or add a small one:
+  // s_ordersDrip.dueAt = millis() + ORD_DRIP_GAP_ITEM_MS;
 }
 
 static void ordersAssignNumbers(uint32_t seed) {
@@ -310,7 +383,8 @@ static void onDeliveredOk(uint8_t houseId){
 
   // 3) Arm ALL current orders and push ONCE
   armAllOrdersFromLocal();
-  ordersPushWindow(3);
+  ordersPushWindowDripStart(3, ORD_DRIP_START_DELAY_MS);  // e.g., 60ms pause after verdict/snapshot
+
 }
 
 enum DeliverReason : uint8_t {
@@ -652,6 +726,23 @@ static void ordersSendShowText(const char* s) {
   Serial.printf("[Central] ORDER_SHOW_TEXT len=%u\n", (unsigned)strlen(p.text));
 }
 
+// === CENTRAL: apply the pushed orders to the delivery validator ===
+// Mirrors g_orders[] into per-house g_orderMask[] so deliveries validate
+static void ordersApplyToValidator() {
+  // If your game only uses houses 1..6 in L1, clear that range:
+  for (int id = 1; id <= 6; ++id) {
+    g_orderMask[id] = MASK_NONE;      // assumes MASK_NONE exists in your codebase
+  }
+  // Now project each order's mask to its house id
+  for (uint8_t i = 0; i < g_orderCount; ++i) {
+    const auto &it = g_orders[i];     // it.house_id, it.mask, it.text
+    if (it.house_id >= 1 && it.house_id <= 6) {
+      g_orderMask[it.house_id] = it.mask;
+    }
+  }
+  Serial.println(F("[central] ordersApplyToValidator: validator masks updated"));
+}
+
 static void sendHouseDigital(
   uint8_t houseId, uint8_t flags,                // flags: b0=window, b1=panel, b2=speaker
   // window
@@ -902,6 +993,7 @@ void loop() {
   PizzaNow::loop();
 
   gameTick();
+  ordersPushWindowDripTick();
 
   String line = readLine();
   if (!line.length()) return;
@@ -1080,7 +1172,16 @@ void loop() {
       return;
     }
 
-    if (rest == "push") { ordersPushWindow(3); return; }
+    if (rest == "push") {
+      ordersPushAll();
+      ordersApplyToValidator();
+      return;
+    }
+
+    if (rest == "apply") {
+      ordersApplyToValidator();
+      return;
+    }
 
     // New: auto-generate one Level-1 order and add to local list
     if (rest == "gen1") {

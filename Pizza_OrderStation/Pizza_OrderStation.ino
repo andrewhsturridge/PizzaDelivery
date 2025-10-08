@@ -56,6 +56,21 @@ static volatile size_t otaDone  = 0;
 static volatile size_t otaTotal = 0;
 static volatile bool   otaActive = false;
 
+static uint32_t g_lampUntil = 0;
+
+static bool os_windowLoading = false;
+
+static PzOrderItemSetPayload OS_orders[3];   // window buffer 0..2
+static uint8_t  OS_count    = 0;             // how many items in the window (0..3)
+static uint8_t  OS_index    = 0;             // selected index 0..OS_count-1
+static bool     OS_loading  = false;         // waiting for ITEM_SETs after RESET
+static char     OS_lastText[128] = "";       // de-dupe buffer
+static uint32_t OS_lastSendMs = 0;
+static uint16_t OS_seq = 1;                  // local sequence for packets we send
+
+// Local window buffer for the 0..2 items we display on the Order Station
+static PzOrderItemSetPayload g_orders[3] = {};
+
 // ---------- helpers ----------
 static void sendHello(){
   HelloPayload hp{}; strlcpy(hp.fw, PizzaIdentity::fw(), sizeof(hp.fw));
@@ -64,23 +79,22 @@ static void sendHello(){
   PizzaNow::sendBroadcast(out, n); PZ_LOGI("HELLO sent (orders-node)");
 }
 
-static void sendShowText(const char* s, bool force=false){
+static void sendShowText(const char* s, bool /*force*/=false) { OS_sendShowTextUnified(s); }
+static void OS_sendShowText(const char* s) { OS_sendShowTextUnified(s); }
+
+// --- Unified: always send ORDER_SHOW_TEXT as if from CENTRAL ---
+static void OS_sendShowTextUnified(const char* s) {
   const char* safe = (s && *s) ? s : "NO ORDERS";
 
-  // STRICT DEDUPE: if text is identical, do nothing unless forced
-  if (!force && strncmp(g_lastSent, safe, sizeof(g_lastSent)) == 0) {
-    return;
-  }
-
-  PzOrderShowTextPayload p{}; strlcpy(p.text, safe, sizeof(p.text));
+  PzOrderShowTextPayload p{};
+  strlcpy(p.text, safe, sizeof(p.text));
 
   uint8_t buf[256];
-  size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, (Role)PIZZA_ROLE, 0, g_seq++, &p, sizeof(p), buf, sizeof(buf));
+  // NOTE: use CENTRAL here so Orders Panel never filters us out
+  static uint16_t seq_for_show = 1;
+  size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, CENTRAL, 0, seq_for_show++, &p, sizeof(p), buf, sizeof(buf));
   PizzaNow::sendBroadcast(buf, n);
-
-  strlcpy(g_lastSent, safe, sizeof(g_lastSent));
-  g_lastSentAt = millis();   // keep if you also use time-based suppression elsewhere
-  Serial.printf("[OrdersNode] ORDER_SHOW_TEXT len=%u\n", (unsigned)strlen(p.text));
+  Serial.printf("[OS] SHOW -> \"%s\"\n", p.text);
 }
 
 static void showNoOrders() {
@@ -112,6 +126,29 @@ static void showCurrent(bool force) {
   }
 
   sendShowText(g_items[g_index].text, force);
+}
+
+// Draw current selection (with light de-dupe & empty-slot guard)
+static void OS_showCurrent(bool force) {
+  const char* s = "NO ORDERS";
+
+  if (OS_count > 0) {
+    const char* t = OS_orders[OS_index].text;   // text filled by ITEM_SET
+    if (!t[0]) {                                // empty means item not arrived yet
+      Serial.printf("[OS] slot %u empty; waiting for ITEM_SET...\n", OS_index);
+      return;
+    }
+    s = t;
+  }
+
+  if (!force) {
+    if (strcmp(OS_lastText, s) == 0 && (millis() - OS_lastSendMs) < 1000) {
+      return; // de-dupe within 1s unless forced
+    }
+  }
+  OS_sendShowText(s);
+  strlcpy(OS_lastText, s, sizeof(OS_lastText));
+  OS_lastSendMs = millis();
 }
 
 static void recomputeCountContiguous() {
@@ -185,6 +222,17 @@ static void neoRingBlinkError() {
   }
 }
 
+static inline void lampPulseStart(uint16_t ms) {
+  digitalWrite(LAMP_PIN, LOW);
+  g_lampUntil = millis() + ms;
+}
+static inline void lampPulseTick() {
+  if (g_lampUntil && (int32_t)(millis() - g_lampUntil) >= 0) {
+    digitalWrite(LAMP_PIN, HIGH);
+    g_lampUntil = 0;
+  }
+}
+
 // ---------- Rx handler ----------
 static bool matchOtaTarget(const OtaStartPayload* p){
   if (p->target_role != (uint8_t)PIZZA_ROLE) return false;
@@ -201,47 +249,45 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     return;
    }
 
-  if (hdr.type == ORDER_LIST_RESET && len >= sizeof(PzOrderListResetPayload)){
-    const auto* p = (const PzOrderListResetPayload*)payload;
-    g_expected = min<uint8_t>(p->count, PZ_ORDERS_MAX);
-    clearItems();
-    g_count = 0; g_index = 0;
-    Serial.printf("[OrdersNode] RESET expect=%u\n", g_expected);
-    if (g_expected == 0) showNoOrders();
+  // === ORDERS: window RESET ===
+  if (hdr.type == ORDER_LIST_RESET && len >= sizeof(PzOrderListResetPayload)) {
+    const PzOrderListResetPayload* r = (const PzOrderListResetPayload*)payload;
+
+    OS_count   = (r->count > 3) ? 3 : r->count;
+    OS_index   = 0;
+    OS_loading = (OS_count > 0);
+
+    for (uint8_t i = 0; i < 3; ++i) {
+      OS_orders[i].index    = i;
+      OS_orders[i].house_id = 0;
+      OS_orders[i].mask     = 0;
+      OS_orders[i].text[0]  = '\0';       // mark as "not yet arrived"
+    }
+    OS_lastText[0] = '\0';                // reset de-dupe on new window
+
+    Serial.printf("[OS] RESET: count=%u (loading=%u)\n", OS_count, OS_loading);
+
+    // If count==0 show "NO ORDERS" once
+    if (OS_count == 0) OS_showCurrent(/*force*/true);
     return;
   }
 
-  if (hdr.type == ORDER_ITEM_SET && len >= sizeof(PzOrderItemSetPayload)){
-    const auto* p = (const PzOrderItemSetPayload*)payload;
-    if (p->index < PZ_ORDERS_MAX && p->index < g_expected){
-      uint8_t oldCount = g_count;
-      g_items[p->index] = *p;
-      recomputeCountContiguous();
+  // === ORDERS: item arrives ===
+  if (hdr.type == ORDER_ITEM_SET && len >= sizeof(PzOrderItemSetPayload)) {
+    const PzOrderItemSetPayload* it = (const PzOrderItemSetPayload*)payload;
 
-      // If list grew from 0 -> >0, start at first item immediately
-      if (oldCount == 0 && g_count > 0) {
-        // show the first used slot (may not be index 0)
-        for (uint8_t i=0; i<g_expected; ++i) {
-          if (g_items[i].text[0] != 0) { g_index = i; break; }
-        }
-        showCurrent(/*force*/true);
-        return;
-      }
+    if (it->index < 3) {
+      // Store entire payload for this slot
+      OS_orders[it->index] = *it;
+      Serial.printf("[OS] ITEM_SET: i=%u H%u mask=0x%02X text=\"%s\"\n",
+                    it->index, it->house_id, it->mask, it->text);
 
-      // If current index went out of range (list shrank), clamp & show
-      if (g_count == 0) { showNoOrders(); return; }
-      if (g_index >= g_expected || g_items[g_index].text[0] == 0) {
-        // hop to first used slot and draw
-        for (uint8_t i=0; i<g_expected; ++i) {
-          if (g_items[i].text[0] != 0) { g_index = i; break; }
-        }
-        showCurrent(/*force*/true);
-        return;
-      }
+      // First useful content has landed
+      OS_loading = false;
 
-      // If the item we are displaying was updated, refresh the panel (dedup guards inside)
-      if (p->index == g_index) {
-        showCurrent(false);
+      // Draw if it's the current selection (or first slot on fresh window)
+      if (it->index == OS_index || it->index == 0) {
+        OS_showCurrent(/*force*/true);
       }
     }
     return;
@@ -303,28 +349,33 @@ void loop(){
     }
   }
 
-  // Button: manual next (still supported)
+  // === ORDER STATION: debounced button handler (90ms), no delay() ===
   bool raw = digitalRead(BTN_PIN);
-  if (raw != g_lastRaw){ g_lastRaw=raw; g_lastEdgeMs=millis(); }
-  if (millis() - g_lastEdgeMs > 35){
-    if (raw != g_btn){
-      g_btn = raw;
-      if (g_btn == LOW){
-        digitalWrite(LAMP_PIN, LOW); delay(60); digitalWrite(LAMP_PIN, HIGH);
+  if (raw != g_lastRaw) {            // edge detected
+    g_lastRaw   = raw;
+    g_lastEdgeMs= millis();
+  }
 
-        if (g_expected == 0 || g_count == 0) {
-          showNoOrders();
+  // accept state change only if stable for 90ms
+  if (millis() - g_lastEdgeMs > 90) {
+    if (raw != g_btn) {
+      g_btn = raw;
+      if (g_btn == LOW) {            // PRESS (active-low button)
+        lampPulseStart(60);          // quick visible pulse, non-blocking
+
+        if (OS_count == 0 || OS_loading) {
+          Serial.println("[OS] press ignored (no items or still loading)");
         } else {
-          // scan forward for the next used slot, wrapping
-          uint8_t win = g_expected;   // we only ever receive a window here (typically 3)
-          for (uint8_t step=1; step<=win; ++step) {
-            uint8_t idx = (g_index + step) % win;
-            if (g_items[idx].text[0] != 0) { g_index = idx; break; }
-          }
-          showCurrent(/*force*/true);
+          if (OS_index >= OS_count) OS_index = 0;      // clamp if window shrank
+          OS_index = (OS_index + 1) % OS_count;        // cycle 0..OS_count-1
+          Serial.printf("[OS] PRESS -> index=%u of %u\n", OS_index, OS_count);
+          OS_showCurrent(/*force*/true);
         }
       }
     }
   }
+
+  // keep lamp pulse non-blocking
+  lampPulseTick();
 
 }
