@@ -16,9 +16,14 @@
 #include "PizzaIdentity.h"
 #include "PizzaUtils.h"
 #include "BuildConfig.h"
+#include "PizzaNetCfg.h"
 
 static uint16_t g_seq = 1;
 static Preferences s_prefsBoxes;
+
+static char g_net_ssid[32] = WIFI_DEFAULT_SSID;
+static char g_net_pass[64] = WIFI_DEFAULT_PASS;
+static char g_net_base[128]= OTA_BASE_URL_DEFAULT;
 
 /*** Block A: GLOBAL STATE + HELPERS ***/
 static const uint8_t MASK_NONE = 0xFF;      // "no order set"
@@ -387,13 +392,6 @@ static void onDeliveredOk(uint8_t houseId){
 
 }
 
-enum DeliverReason : uint8_t {
-  DR_OK = 0,
-  DR_UNKNOWN_PIZZA = 1,
-  DR_NO_ORDER = 2,
-  DR_WRONG_PIZZA = 3,
-};
-
 static void stateInit() {
   for (int i = 0; i < 256; ++i) g_orderMask[i] = MASK_NONE;
   g_tagCount = 0;
@@ -632,6 +630,17 @@ static void sendHelloReq() {
   size_t n = PizzaProtocol::pack(HELLO_REQ, CENTRAL, 0, g_seq++, nullptr, 0, buf, sizeof(buf));
   PizzaNow::sendBroadcast(buf, n);
   PZ_LOGI("HELLO_REQ broadcast");
+}
+
+static void sendNetCfgSet(const char* ssid, const char* pass, const char* base) {
+  NetCfgSetPayload p{};
+  if (ssid) strlcpy(p.ssid, ssid, sizeof(p.ssid));
+  if (pass) strlcpy(p.pass, pass, sizeof(p.pass));
+  if (base) strlcpy(p.base, base, sizeof(p.base));
+  uint8_t buf[256];
+  size_t n = PizzaProtocol::pack(NET_CFG_SET, CENTRAL, 0, g_seq++, &p, sizeof(p), buf, sizeof(buf));
+  PizzaNow::sendBroadcast(buf, n);
+  Serial.printf("[Central] NET_CFG_SET -> ssid=\"%s\" base=\"%s\"\n", p.ssid, p.base);
 }
 
 static void sendPanelText(uint8_t houseId, const String& text, uint8_t style, uint8_t speed, uint8_t bright) {
@@ -937,40 +946,95 @@ static int parseInt(const String& s, int def=0){ char* e=nullptr; long v=strtol(
 /*** Central CLI: help printer ***/
 static void printHelp() {
   Serial.println(F("=== Central CLI Help ==="));
-  Serial.println(F(""));
+  Serial.println();
+
+  // General
   Serial.println(F("General"));
   Serial.println(F("  help | ?                       Show this help"));
   Serial.println(F("  list                           Print device roster"));
   Serial.println(F("  hello-req                      Ask nodes to send HELLO"));
-  Serial.println(F(""));
+  Serial.println();
+
+  // Boxes (pizza box UID management)
+  Serial.println(F("Boxes (pizza box UID management)"));
+  Serial.println(F("  boxes show                     Show current 1..6 box UID slots"));
+  Serial.println(F("  boxes clear [n]                Clear all or slot n (1..6)"));
+  Serial.println(F("  boxes set <n> <UIDhex>         Set slot n with UID (colons ok)"));
+  Serial.println(F("  boxes learn <n>                Learn next scanned tag into slot n"));
+  Serial.println(F("  boxes reload                   Reload from NVS and show"));
+  Serial.println();
+
+  // Facts
+  Serial.println(F("Facts"));
+  Serial.println(F("  facts show                     Print internal constants/config"));
+  Serial.println();
+
+  // Panels
   Serial.println(F("Panels"));
   Serial.println(F("  panel <id> \"text\" [style] [speed] [bright]"));
-  Serial.println(F("      style: 0=scroll, 1=static (see PizzaPanel defs)"));
-  Serial.println(F("      speed: 1..5, bright: 0..255"));
-  Serial.println(F(""));
+  Serial.println(F("      style: 0=scroll, 1=static; speed: 1..5; bright: 0..255"));
+  Serial.println();
+
+  // Sound
   Serial.println(F("Sound"));
-  Serial.println(F("  sound <id> [clip] [vol]        vol: 0..255"));
-  Serial.println(F(""));
+  Serial.println(F("  sound <id> [clip] [vol]        Play clip on house speaker (vol 0..255)"));
+  Serial.println();
+
+  // Scenes & Assets
+  Serial.println(F("Scenes & Assets"));
+  Serial.println(F("  scene <id> party|stop|number <digits>"));
+  Serial.println(F("  clips sync <id|all> <base_url> <count>"));
+  Serial.println();
+
+  // OTA / Updates
   Serial.println(F("OTA / Updates"));
   Serial.println(F("  update <ROLE> all|id=<n> [url]"));
   Serial.println(F("      ROLE: HOUSE_PANEL | HOUSE_NODE | ORDERS_PANEL | ORDERS_NODE | PIZZA_NODE | CENTRAL"));
-  Serial.println(F(""));
+  Serial.println();
+
+  // Claiming
   Serial.println(F("Claiming"));
   Serial.println(F("  claim <MAC> <id> [force]       ex: claim AA:BB:CC:DD:EE:FF 3"));
-  Serial.println(F(""));
+  Serial.println();
+
+  // Game
+  Serial.println(F("Game"));
+  Serial.println(F("  game start [minutes] [level]   Start a timed game (default 3 1)"));
+  Serial.println(F("  game stop                      End game and clear orders"));
+  Serial.println(F("  game status                    Print current game state"));
+  Serial.println(F("  game next                      Advance to next level"));
+  Serial.println(F("  game target <n>                Set OKs needed to complete level"));
+  Serial.println(F("  game auto on|off               Auto-advance on target reached"));
+  Serial.println(F("  game minutes <n>               Default duration for next start"));
+  Serial.println();
+
+  // Delivery Validator (per-house mask)
   Serial.println(F("Delivery Validator (per-house mask)"));
-  Serial.println(F("  order <id> <mask>              set target mask for house (0..31 or 0xNN)"));
-  Serial.println(F("  order show [id]                show orders (all or one)"));
-  Serial.println(F("  order clear <id>               clear order for a house"));
-  Serial.println(F("  tags                           list remembered uid->mask cache"));
-  Serial.println(F(""));
-  Serial.println(F("Operator Orders (text list for Orders Node/Panel)"));
-  Serial.println(F("  orders reset                   clear local list (max 6 items)"));
+  Serial.println(F("  order <id> <mask>              Set validator mask (0..31 or 0xNN)"));
+  Serial.println(F("  order show [id]                Show validator(s)"));
+  Serial.println(F("  order clear <id>               Clear validator"));
+  Serial.println(F("  tags                           List recent tag->mask cache"));
+  Serial.println();
+
+  // Operator Orders (Orders Node/Panel list)
+  Serial.println(F("Operator Orders (Orders Node/Panel list)"));
+  Serial.println(F("  orders reset                   Clear local list (max 6 items)"));
   Serial.println(F("  orders add <house> <mask> \"text\""));
-  Serial.println(F("  orders show                    print local list"));
-  Serial.println(F("  orders push                    broadcast list to Orders Node"));
-  Serial.println(F("  orders showidx <n>             display item n on Orders Panel"));
-  Serial.println(F("  orders show \"text\"            display ad-hoc text on Orders Panel"));
+  Serial.println(F("  orders show                    Print local list"));
+  Serial.println(F("  orders push                    Broadcast list to Orders Node (+apply)"));
+  Serial.println(F("  orders apply                   Apply current list to validators"));
+  Serial.println(F("  orders pool reset              Generate new 6-number house pool"));
+  Serial.println(F("  orders pool show               Show current house numbers"));
+  Serial.println(F("  orders gen1                    Auto-add one L1 order (with clue)"));
+  Serial.println(F("  orders showidx <n>             Display item n on Orders Panel"));
+  Serial.println(F("  orders show \"text\"            Display ad-hoc text on Orders Panel"));
+  Serial.println();
+
+  // Network
+  Serial.println(F("Network"));
+  Serial.println(F("  net show                      Show current SSID/PASS/BASE (central-side)"));
+  Serial.println(F("  net set \"ssid\" \"pass\" \"base\"  Update central-side values"));
+  Serial.println(F("  net push                      Broadcast SSID/PASS/BASE to all nodes"));
   Serial.println();
 }
 
@@ -1051,13 +1115,19 @@ void loop() {
     Role role=parseRole(roleStr);
     String target=(s2>0)? line.substring(s2+1) : "all"; target.trim();
     bool all = target.startsWith("all"); int id=0;
-    const char* defUrl=nullptr;
-    if (role==HOUSE_PANEL) defUrl = OTA_BASE_URL OTA_REL_HOUSE_PANEL;
-    else if (role==HOUSE_NODE) defUrl = OTA_BASE_URL OTA_REL_HOUSE_NODE;
-    else if (role==ORDERS_PANEL) defUrl = OTA_BASE_URL OTA_REL_ORDERS_PANEL;
-    else if (role==ORDERS_NODE) defUrl = OTA_BASE_URL OTA_REL_ORDERS_NODE;
-    else if (role==PIZZA_NODE) defUrl = OTA_BASE_URL OTA_REL_PIZZA_NODE;
-    else if (role==CENTRAL) defUrl = OTA_BASE_URL OTA_REL_CENTRAL;
+
+    // Load runtime base URL (editable via net set / net push)
+    NetCfg::Value net{};
+    NetCfg::load(net);
+    String base = String(net.base);
+
+    const char* rel = nullptr;
+    if (role==HOUSE_PANEL)  rel = OTA_REL_HOUSE_PANEL;
+    else if (role==HOUSE_NODE)  rel = OTA_REL_HOUSE_NODE;
+    else if (role==ORDERS_PANEL)rel = OTA_REL_ORDERS_PANEL;
+    else if (role==ORDERS_NODE) rel = OTA_REL_ORDERS_NODE;
+    else if (role==PIZZA_NODE)  rel = OTA_REL_PIZZA_NODE;
+    else if (role==CENTRAL)     rel = OTA_REL_CENTRAL;
 
     String urlOverride;
     int sp=target.indexOf(' ');
@@ -1068,7 +1138,9 @@ void loop() {
       if (sp>0) urlOverride = target.substring(sp+1);
     }
     urlOverride.trim();
-    String url = urlOverride.length()? urlOverride : String(defUrl);
+
+    String defUrl = base + rel;                    // <- runtime base + role-specific .bin
+    String url = urlOverride.length()? urlOverride : defUrl;
     sendOtaStart(role, all, (uint8_t)id, url.c_str());
     return;
   }
@@ -1379,5 +1451,55 @@ void loop() {
   if (line.startsWith("game auto ")){ String v=line.substring(10); v.trim(); g_game.autoAdvance=(v=="on"); gamePrintStatus(); return; }
   // game minutes <n> -> change duration for next start
   if (line.startsWith("game minutes ")){ int m=line.substring(13).toInt(); if (m>0) g_game.durationMs=(uint32_t)m*60UL*1000UL; return; }
+  // net show
+  if (line == "net show") {
+    Serial.printf("net: ssid=\"%s\"\n", g_net_ssid);
+    Serial.printf("net: pass=\"%s\"\n", g_net_pass);
+    Serial.printf("net: base=\"%s\"\n", g_net_base);
+    return;
+  }
+
+  // net set "<ssid>" "<pass>" "<base_url>"
+  if (line.startsWith("net set ")) {
+    String rest = line.substring(8);
+    rest.trim();
+
+    // Expect 3 quoted strings: "ssid" "pass" "base"
+    auto usage = [](){ Serial.println(F("usage: net set \"<ssid>\" \"<pass>\" \"<base_url>\"")); };
+
+    String s1, s2, s3;
+
+    // 1) SSID
+    int q1 = rest.indexOf('"'); if (q1 < 0) { usage(); return; }
+    int q2 = rest.indexOf('"', q1 + 1); if (q2 < 0) { usage(); return; }
+    s1 = rest.substring(q1 + 1, q2);
+    rest = rest.substring(q2 + 1); rest.trim();
+
+    // 2) PASS
+    q1 = rest.indexOf('"'); if (q1 < 0) { usage(); return; }
+    q2 = rest.indexOf('"', q1 + 1); if (q2 < 0) { usage(); return; }
+    s2 = rest.substring(q1 + 1, q2);
+    rest = rest.substring(q2 + 1); rest.trim();
+
+    // 3) BASE URL
+    q1 = rest.indexOf('"'); if (q1 < 0) { usage(); return; }
+    q2 = rest.indexOf('"', q1 + 1); if (q2 < 0) { usage(); return; }
+    s3 = rest.substring(q1 + 1, q2);
+
+    if (!s1.length() || !s2.length() || !s3.length()) { usage(); return; }
+
+    strlcpy(g_net_ssid, s1.c_str(), sizeof(g_net_ssid));
+    strlcpy(g_net_pass, s2.c_str(), sizeof(g_net_pass));
+    strlcpy(g_net_base, s3.c_str(), sizeof(g_net_base));
+    Serial.println(F("net: updated local values (use `net push` to broadcast)"));
+    return;
+  }
+
+  // net push
+  if (line == "net push") {
+    sendNetCfgSet(g_net_ssid, g_net_pass, g_net_base);
+    return;
+  }
+
 
 }

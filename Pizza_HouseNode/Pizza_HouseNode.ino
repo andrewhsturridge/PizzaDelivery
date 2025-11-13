@@ -25,6 +25,7 @@
 #include "PizzaAudio.h"
 #include "PizzaOta.h"
 #include "PizzaAudioFS.h"
+#include "PizzaNetCfg.h"
 
 static uint16_t g_seq = 1;
 Preferences prefs;
@@ -138,11 +139,12 @@ static void applyWindow(uint8_t fx, uint8_t h, uint8_t s, uint8_t v, uint8_t spd
 }
 
 // Asset Sync: to pivot radio for HTTP (Pizza_HouseNode.ino)
-static void doAssetSync(const AssetSyncPayload* ap){
+static void doAssetSync(const AssetSyncPayload* ap) {
   Serial.printf("[House %u] ASSET_SYNC start: url=\"%s\" count=%u\n",
                 g_houseId, ap->base_url, ap->count);
 
-  uint8_t okCount = 0, code = 0;
+  uint8_t okCount = 0;
+  uint8_t code    = 0;   // 0=all ok, 2=some failed, 10=wifi fail
 
   if (!LittleFS.begin()) LittleFS.begin(true);
   LittleFS.mkdir("/clips");
@@ -151,32 +153,24 @@ static void doAssetSync(const AssetSyncPayload* ap){
   PizzaNow::deinit();
   delay(50);
 
-  // 2) Join Wi-Fi using the exact OTA path
+  // 2) Join Wi-Fi using the OTA path (PizzaOta::beginWifi should use NetCfg::load)
   if (!PizzaOta::beginWifi(20000)) {
     Serial.printf("[House %u] ASSET_SYNC WiFi connect failed\n", g_houseId);
     code = 10;
   } else {
-    // 3) HTTP client setup (same as OTA)
-    WiFiClient client; client.setTimeout(20000);
-    HTTPClient http;
-    http.setConnectTimeout(15000);
-    http.setTimeout(20000);
-    http.setReuse(false);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.useHTTP10(true);
+    okCount = 0;
+    code    = 0; // assume success; mark 2 on any file failure
 
-    // 4) Pull files 1..count
-    // download loop – skip 404s
-    okCount = 0;              // count of successfully fetched files
-    code    = 0;              // 0=all ok, 2=some missing/failed
-
+    // 3) Pull files 1..count
     for (uint8_t i = 1; i <= ap->count; ++i) {
       char url[160];  snprintf(url,  sizeof(url),  "%s/%03u.wav", ap->base_url, (unsigned)i);
       char path[32];  snprintf(path, sizeof(path), "/clips/%03u.wav", (unsigned)i);
       Serial.printf("[House %u] GET %s -> %s\n", g_houseId, url, path);
 
+      WiFiClient client;
+      client.setTimeout(20000);
+
       HTTPClient http;
-      WiFiClient client; client.setTimeout(20000);
       http.setConnectTimeout(15000);
       http.setTimeout(20000);
       http.setReuse(false);
@@ -184,50 +178,51 @@ static void doAssetSync(const AssetSyncPayload* ap){
       http.useHTTP10(true);
 
       if (!http.begin(client, url)) {
-        Serial.println("[ASSET] http.begin failed – skipping");
+        Serial.println("[ASSET] http.begin failed — skipping");
         code = 2;
         http.end();
-        continue; // try next clip
+        continue;
       }
 
       int rc = http.GET();
       Serial.printf("[ASSET] HTTP GET -> %d\n", rc);
       if (rc != HTTP_CODE_OK) {
-        // 404 etc: skip but keep going so later clips (e.g. 005) can still download
-        code = 2;
+        code = 2; // partial failure
         http.end();
         continue;
       }
 
       File f = LittleFS.open(path, FILE_WRITE);
       if (!f) {
-        Serial.println("[ASSET] open path failed – skipping");
+        Serial.println("[ASSET] open path failed — skipping");
         code = 2;
         http.end();
         continue;
       }
 
       WiFiClient* s = http.getStreamPtr();
-      uint8_t buf[2048]; int r = 0; size_t total = 0;
-      while ((r = s->readBytes((char*)buf, sizeof(buf))) > 0) { f.write(buf, r); total += r; }
+      uint8_t buf[2048];
+      int r = 0;
+      size_t total = 0;
+      while ((r = s->readBytes((char*)buf, sizeof(buf))) > 0) {
+        f.write(buf, r);
+        total += r;
+      }
       f.close();
       http.end();
 
       okCount++;
       Serial.printf("[House %u] WROTE %s (%u bytes)\n", g_houseId, path, (unsigned)total);
     }
-
-    // If some failed, leave code=2; success only if all fetched
-    // ar.ok will remain (okCount == ap->count)
   }
 
-  // 5) Leave Wi-Fi (OTA path), restore ESPNOW
+  // 4) Leave Wi-Fi (OTA path), restore ESPNOW
   PizzaOta::endWifi();
   delay(30);
   PizzaNow::begin(ESPNOW_CHANNEL);
   PizzaNow::onReceive(onRx);
 
-  // 6) Report result to Central (over ESPNOW)
+  // 5) Report result to Central (over ESPNOW)
   AssetResultPayload ar{};
   ar.house_id   = g_houseId;
   ar.ok         = (okCount == ap->count) ? 1 : 0;
@@ -240,7 +235,7 @@ static void doAssetSync(const AssetSyncPayload* ap){
   Serial.printf("[House %u] ASSET_SYNC done: ok=%u count=%u code=%u\n",
                 g_houseId, ar.ok, ar.count_done, ar.code);
 
-  // 7) Reboot on success (mirrors OTA’s success behavior)
+  // 6) Reboot on success (mirrors OTA’s success behavior)
   if (ar.ok) {
     Serial.println("[House] ASSET_SYNC success → rebooting...");
     delay(200);
@@ -388,6 +383,24 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     return;
   }
 
+  if (hdr.type == NET_CFG_SET && len >= sizeof(NetCfgSetPayload)) {
+    const NetCfgSetPayload* p = (const NetCfgSetPayload*)payload;
+
+    NetCfg::Value v{};
+    strlcpy(v.ssid, p->ssid, sizeof(v.ssid));
+    strlcpy(v.pass, p->pass, sizeof(v.pass));
+    strlcpy(v.base, p->base, sizeof(v.base));
+
+    bool ok = NetCfg::save(v);
+    Serial.printf("[Node] NET_CFG_SET: ssid=\"%s\" base=\"%s\" save=%s\n",
+                  v.ssid, v.base, ok?"OK":"FAIL");
+
+    // Optional: immediate apply strategy
+    // If you run STA for asset/OTA fetch, you can reconnect here, or just reboot:
+    esp_restart();  // <— simplest: reboot to apply new Wi-Fi/host settings
+    return;
+  }
+
 }
 
 static void cfgLoad() {
@@ -454,6 +467,9 @@ void setup() {
     strip.show(); delay(150);
   }
   strip.clear(); strip.show();
+
+  NetCfg::Value net{};
+  NetCfg::load(net);
 
   PizzaOta::setProgressCallback(nodeOtaProgress);
 
