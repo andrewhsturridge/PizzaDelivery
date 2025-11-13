@@ -21,6 +21,7 @@
 #include "BuildConfig.h"
 #include "PizzaRfid.h"
 #include "PizzaOta.h"
+#include "PizzaNetCfg.h"
 
 // ---------- Generic NeoPixel Ring Config ----------
 #ifndef NEOPIXEL_PIN
@@ -143,6 +144,7 @@ static void tagDetached() {
 static void neoRingInit() {
   neopixelRing.begin();
   neopixelRing.setBrightness(NEOPIXEL_BRIGHTNESS);
+  neopixelRing.clear();
   neopixelRing.show();
 }
 
@@ -258,6 +260,25 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     g_otaPending = true; PZ_LOGI("OTA queued: %s", g_otaUrl);
     return;
   }
+
+  // Accept runtime SSID/PASS/BASE from Central
+  if (hdr.type == NET_CFG_SET && len >= sizeof(NetCfgSetPayload)) {
+    const NetCfgSetPayload* p = (const NetCfgSetPayload*)payload;
+
+    NetCfg::Value v{};
+    strlcpy(v.ssid, p->ssid, sizeof(v.ssid));
+    strlcpy(v.pass, p->pass, sizeof(v.pass));
+    strlcpy(v.base, p->base, sizeof(v.base));
+
+    bool ok = NetCfg::save(v);
+    Serial.printf("[PizzaNode] NET_CFG_SET: ssid=\"%s\" base=\"%s\" save=%s\n",
+                  v.ssid, v.base, ok ? "OK" : "FAIL");
+
+    // Reboot so future OTA/HTTP uses the new settings
+    esp_restart();
+    return;
+  }
+
 }
 
 // ---------------- Setup/Loop ----------------

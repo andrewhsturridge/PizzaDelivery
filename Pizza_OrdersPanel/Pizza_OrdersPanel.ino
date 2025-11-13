@@ -8,8 +8,9 @@
 #include "PizzaIdentity.h"
 #include "PizzaUtils.h"
 #include "BuildConfig.h"
-#include "PizzaPanel.h"  // <-- same helper HousePanels use
+#include "PizzaPanel.h"
 #include "PizzaOta.h"
+#include "PizzaNetCfg.h"
 
 static uint16_t g_seq = 1;
 static uint32_t g_helloDueAt = 0;
@@ -84,6 +85,25 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     PZ_LOGI("OTA queued: %s", g_otaUrl);
     return;
   }
+
+  // Accept runtime SSID/PASS/BASE from Central
+  if (hdr.type == NET_CFG_SET && len >= sizeof(NetCfgSetPayload)) {
+    const NetCfgSetPayload* p = (const NetCfgSetPayload*)payload;
+
+    NetCfg::Value v{};
+    strlcpy(v.ssid, p->ssid, sizeof(v.ssid));
+    strlcpy(v.pass, p->pass, sizeof(v.pass));
+    strlcpy(v.base, p->base, sizeof(v.base));
+
+    bool ok = NetCfg::save(v);
+    Serial.printf("[OrdersPanel] NET_CFG_SET: ssid=\"%s\" base=\"%s\" save=%s\n",
+                  v.ssid, v.base, ok ? "OK" : "FAIL");
+
+    // Reboot to apply next time OTA/assets are needed
+    esp_restart();
+    return;
+  }
+
 }
 
 void setup(){

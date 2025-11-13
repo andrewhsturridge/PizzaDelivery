@@ -54,8 +54,8 @@ enum HHandleShape: uint8_t { HS_ROUND=0, HS_BAR=1 };
 enum HHandleColor: uint8_t { HCOL_SILVER=0, HCOL_GOLD=1 };
 
 // Index by house id [1..6]
-static uint8_t g_fact_houseColor[7] = {0, HC_RED,    HC_BLUE,   HC_YELLOW, HC_RED,    HC_YELLOW, HC_BLUE};
-static uint8_t g_fact_doorColor [7] = {0, DC_GREY,   DC_WHITE,  DC_BROWN,  DC_BROWN,  DC_WHITE,  DC_GREY};
+static uint8_t g_fact_houseColor[7] = {0, HC_BLUE,    HC_RED,   HC_YELLOW, HC_BLUE,    HC_YELLOW, HC_RED};
+static uint8_t g_fact_doorColor [7] = {0, DC_WHITE,   DC_GREY,  DC_BROWN,  DC_GREY,  DC_WHITE,  DC_BROWN};
 static uint8_t g_fact_handleShape[7]= {0, HS_ROUND,  HS_ROUND,  HS_BAR,    HS_ROUND,  HS_ROUND,  HS_ROUND};
 static uint8_t g_fact_handleColor[7]= {0, HCOL_SILVER,HCOL_SILVER,HCOL_SILVER,HCOL_GOLD,HCOL_GOLD,HCOL_GOLD};
 
@@ -150,6 +150,9 @@ static void gameStart(uint16_t minutes, uint8_t level){
   // Fresh list + masks
   ordersResetLocal();
 
+  // Reset any remembered toppings from previous sessions
+  ingredientsResetAll();
+
   // Seed orders: L1 -> 3, otherwise 1
   uint8_t seeds = (g_game.level==1 ? L1_SEED_ORDERS : 1);
   for (uint8_t i=0; i<seeds; ++i) {
@@ -174,6 +177,8 @@ static void gameStop(){
   // Clear list; OrderStation will show "NO ORDERS"
   gameResetOrdersAndMasks();
   ordersPushAll();
+  // Also clear all remembered toppings at game end
+  ingredientsResetAll();
   Serial.println("game: STOP");
   gamePrintStatus();
 }
@@ -437,6 +442,22 @@ static void ingrClearTag(const uint8_t* uid, uint8_t uidLen) {
   sp.ok   = 1;
   sp.mask = 0;                            // broadcast "now empty"
   sendIngrSnapshot(sp);
+}
+
+// Clear ALL remembered pizza ingredients and broadcast "empty" snapshots
+static void ingredientsResetAll() {
+  // Tell everyone each known UID is now empty
+  for (uint8_t i = 0; i < g_tagCount; ++i) {
+    PizzaIngrSnapshotPayload sp{};
+    sp.uid_len = g_tags[i].len;
+    memcpy(sp.uid, g_tags[i].uid, g_tags[i].len);
+    sp.ok   = 1;
+    sp.mask = 0;
+    sendIngrSnapshot(sp);
+  }
+  // Wipe our cache
+  g_tagCount = 0;
+  Serial.println("[central] ingredients: reset all (cache cleared and snapshots broadcast)");
 }
 
 static void printMask(uint8_t m) {

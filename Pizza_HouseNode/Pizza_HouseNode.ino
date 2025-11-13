@@ -59,6 +59,45 @@ Adafruit_NeoPixel strip(LED_COUNT, PIN_WS2812, NEO_GRB + NEO_KHZ800);
 // --- Beep buffer (22050 Hz, ~200ms, 1kHz sine) ---
 static int16_t beepBuf[4410/2]; // ~200 ms (~22050*0.2) -> 4410 samples; halve for size
 
+
+// Write a 16-bit mono 22,050 Hz WAV file with a simple sine beep
+static bool writeBeepWav(const char* path, float freq_hz, uint16_t ms, uint8_t amplitude /*0..255*/) {
+  const uint32_t sr = 22050;
+  const uint32_t samples = (sr * ms) / 1000;
+  File f = LittleFS.open(path, FILE_WRITE);
+  if (!f) return false;
+
+  // WAV header (PCM, 16-bit mono)
+  uint32_t dataBytes = samples * 2;
+  uint32_t riffSize  = 36 + dataBytes;
+  auto w16=[&](uint16_t v){ f.write((uint8_t*)&v,2); };
+  auto w32=[&](uint32_t v){ f.write((uint8_t*)&v,4); };
+
+  f.write((const uint8_t*)"RIFF",4); w32(riffSize);
+  f.write((const uint8_t*)"WAVE",4);
+  f.write((const uint8_t*)"fmt ",4); w32(16); w16(1); w16(1); w32(sr); w32(sr*2); w16(2); w16(16);
+  f.write((const uint8_t*)"data",4); w32(dataBytes);
+
+  // Samples
+  const float twoPiF = 2.0f * 3.14159265f * freq_hz;
+  for (uint32_t i=0;i<samples;i++){
+    float t = (float)i / (float)sr;
+    float s = sinf(twoPiF * t);
+    int16_t v = (int16_t)((int)(amplitude) * 128 * s); // ~ -12 dBFS at amplitude=180
+    f.write((uint8_t*)&v, 2);
+  }
+  f.close();
+  return true;
+}
+
+// Call this once in setup() after LittleFS.begin()
+static void ensureBeepWavs() {
+  if (!LittleFS.begin()) LittleFS.begin(true);
+  LittleFS.mkdir("/clips");
+  if (!LittleFS.exists("/clips/090.wav")) writeBeepWav("/clips/090.wav", 1000.0f, 200, 180); // OK beep
+  if (!LittleFS.exists("/clips/091.wav")) writeBeepWav("/clips/091.wav",  400.0f, 200, 180); // ERR beep
+}
+
 // LED effect state (driven from loop)
 enum Effect { EFFECT_NONE, EFFECT_OK_PULSE, EFFECT_ERR_PULSE, EFFECT_YELLOW_PING };
 static Effect   g_fx      = EFFECT_NONE;
@@ -104,6 +143,21 @@ static void fillBeep() {
     float t = (float)i / sr;
     float s = sinf(2.0f*PI*freq*t);
     beepBuf[i] = (int16_t)(s * 16000); // ~-12 dBFS
+  }
+}
+
+// Play built-in OK/ERR beeps; auto-generate WAVs if missing.
+static void playResultBeep(bool ok, uint8_t vol) {
+  if (!LittleFS.begin()) LittleFS.begin(true);
+  LittleFS.mkdir("/clips");
+  // ensure files exist
+  if (!LittleFS.exists("/clips/090.wav")) writeBeepWav("/clips/090.wav", 1000.0f, 200, 180);
+  if (!LittleFS.exists("/clips/091.wav")) writeBeepWav("/clips/091.wav",  400.0f, 200, 180);
+
+  PizzaAudioFS::setVolume(vol);
+  uint8_t clip = ok ? 90 : 91;
+  if (!PizzaAudioFS::playClip(clip, /*loop=*/false)) {
+    Serial.printf("[House %u] playClip(%03u) failed\n", g_houseId, clip);
   }
 }
 
@@ -277,22 +331,18 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
   /*** onRx: delivery verdict from Central ***/
   if (hdr.type == DELIVER_RESULT && len >= sizeof(DeliverResultPayload)) {
     const DeliverResultPayload* r = (const DeliverResultPayload*)payload;
-    if (hdr.house_id == g_houseId) { // only react if it’s for me
+    if (hdr.house_id == g_houseId) {
       g_haveResult = true;
       g_lastOk     = (r->ok != 0);
       g_lastReason = r->reason;
 
       if (g_lastOk) {
         g_fx = EFFECT_OK_PULSE; g_fxUntil = millis() + 600;
-        // If you want a success chirp from FS, put a small file at /clips/090.wav and uncomment:
-        // PizzaAudioFS::setVolume(180);
-        // PizzaAudioFS::playClip(90, /*loop=*/false);
+        playResultBeep(true, 180);           // <— play OK beep
         PZ_LOGI("DELIVER_RESULT OK");
       } else {
         g_fx = EFFECT_ERR_PULSE; g_fxUntil = millis() + 600;
-        // Optional error chirp (/clips/091.wav):
-        // PizzaAudioFS::setVolume(160);
-        // PizzaAudioFS::playClip(91, /*loop=*/false);
+        playResultBeep(false, 160);          // <— play ERR beep
         PZ_LOGI("DELIVER_RESULT ERR reason=%u", r->reason);
       }
     }
@@ -492,6 +542,7 @@ void setup() {
 
   // AUDIO last
   PizzaAudioFS::begin(I2S_BCLK, I2S_LRCK, I2S_DOUT);
+  ensureBeepWavs();
   PizzaAudioFS::setVolume(180);
   // run audio loop on the other core so it’s always serviced
   xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, 3, &g_audioTask, 0);

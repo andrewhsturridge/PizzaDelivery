@@ -12,6 +12,7 @@
 #include "BuildConfig.h"
 #include "PizzaPanel.h"
 #include "PizzaOta.h"
+#include "PizzaNetCfg.h"
 
 static uint16_t g_seq = 1;
 
@@ -154,6 +155,23 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     strlcpy(g_otaVer, p->ver, sizeof(g_otaVer));
     g_otaPending = true;
     PZ_LOGI("OTA queued: %s", g_otaUrl);
+    return;
+  }
+
+  if (hdr.type == NET_CFG_SET && len >= sizeof(NetCfgSetPayload)) {
+    const NetCfgSetPayload* p = (const NetCfgSetPayload*)payload;
+
+    NetCfg::Value v{};
+    strlcpy(v.ssid, p->ssid, sizeof(v.ssid));
+    strlcpy(v.pass, p->pass, sizeof(v.pass));
+    strlcpy(v.base, p->base, sizeof(v.base));
+
+    bool ok = NetCfg::save(v);
+    Serial.printf("[HousePanel] NET_CFG_SET: ssid=\"%s\" base=\"%s\" save=%s\n",
+                  v.ssid, v.base, ok ? "OK" : "FAIL");
+
+    // Simple: reboot to apply new Wi-Fi/host settings next time OTA/assets are needed
+    esp_restart();
     return;
   }
 
