@@ -81,16 +81,29 @@ struct GameState {
   uint8_t   level;         // 1..5
   uint16_t  targetOK;      // OK deliveries to "complete" a level (optional)
   bool      autoAdvance;   // auto level-up when targetOK reached
+
+  // NEW: lives
+  uint8_t   livesMax;      // configured max lives (default 5)
+  uint8_t   livesLeft;     // current lives in this run
+
   uint16_t  okTotal;       // across all levels
   uint16_t  okLevel;       // within current level
   uint32_t  score;         // +100 * level per OK
   uint32_t  durationMs;    // game length
   uint32_t  startedAt;     // millis()
   uint32_t  endsAt;        // startedAt + durationMs
-  uint16_t  genLevel;      // NEW: how many orders generated this level
-} g_game = { GP_IDLE, 1, /*targetOK*/6, /*autoAdv*/false,
-             0,0,0, /*duration*/180000, 0,0,
-             /*genLevel*/0 };
+  uint16_t  genLevel;      // how many orders generated this level
+} g_game = {
+  /*phase*/GP_IDLE,
+  /*level*/1,
+  /*targetOK*/6,
+  /*autoAdv*/false,
+  /*livesMax*/5,       // default lives
+  /*livesLeft*/5,      // initialized to livesMax at start
+  /*okTotal*/0, /*okLevel*/0, /*score*/0,
+  /*duration*/180000, /*startedAt*/0, /*endsAt*/0,
+  /*genLevel*/0
+};
 
 static uint32_t g_gameTickDueAt = 0;
 
@@ -122,12 +135,27 @@ static void gameResetOrdersAndMasks(){
   for (int i=0;i<256;i++) g_orderMask[i] = MASK_NONE;
 }
 
+// Print status (now includes lives)
 static void gamePrintStatus(){
   uint32_t now = millis();
   int32_t remaining = (g_game.phase==GP_RUNNING)? (int32_t)(g_game.endsAt - now) : 0;
-  Serial.printf("game: phase=%s level=%u score=%lu okLevel=%u/%u okTotal=%u timeLeft=%ldms\n",
+  Serial.printf("game: phase=%s level=%u lives=%u/%u score=%lu okLevel=%u/%u okTotal=%u timeLeft=%ldms\n",
     (g_game.phase==GP_IDLE?"IDLE":(g_game.phase==GP_RUNNING?"RUNNING":"OVER")),
-    g_game.level, (unsigned long)g_game.score, g_game.okLevel, g_game.targetOK, g_game.okTotal, (long)remaining);
+    g_game.level, g_game.livesLeft, g_game.livesMax,
+    (unsigned long)g_game.score, g_game.okLevel, g_game.targetOK, g_game.okTotal, (long)remaining);
+}
+
+// Lose one life (end game if hits 0)
+static void gameLoseLife(uint8_t reason){
+  if (g_game.phase != GP_RUNNING) return;
+  if (g_game.livesLeft > 0) g_game.livesLeft--;
+  Serial.printf("game: LIFE LOST (reason=%u) -> %u/%u\n", reason, g_game.livesLeft, g_game.livesMax);
+  if (g_game.livesLeft == 0) {
+    Serial.println("game: OUT OF LIVES");
+    gameStop();
+  } else {
+    gamePrintStatus();
+  }
 }
 
 static void gameStart(uint16_t minutes, uint8_t level){
@@ -143,6 +171,13 @@ static void gameStart(uint16_t minutes, uint8_t level){
   g_game.endsAt     = g_game.startedAt + g_game.durationMs;
   g_game.genLevel   = 0;
 
+  // Lives
+  if (g_game.livesMax == 0) g_game.livesMax = 5;
+  g_game.livesLeft = g_game.livesMax;
+
+  // >>> Reset any remembered toppings from previous sessions <<<
+  ingredientsResetAll();
+
   // Fresh numbers + panels
   ordersAssignNumbers(esp_random());
   housesNumbersShow();
@@ -150,23 +185,17 @@ static void gameStart(uint16_t minutes, uint8_t level){
   // Fresh list + masks
   ordersResetLocal();
 
-  // Reset any remembered toppings from previous sessions
-  ingredientsResetAll();
-
-  // Seed orders: L1 -> 3, otherwise 1
+  // Seed orders
   uint8_t seeds = (g_game.level==1 ? L1_SEED_ORDERS : 1);
-  for (uint8_t i=0; i<seeds; ++i) {
-    if (ordersGenLevel1()) ++g_game.genLevel;
-  }
+  for (uint8_t i=0; i<seeds; ++i) if (ordersGenLevel1()) ++g_game.genLevel;
 
-  // Arm validators for ALL seeded orders and push once
+  // Arm & push once
   armAllOrdersFromLocal();
-  ordersPushWindowDripStart(3 /*max*/, 0 /*start delay*/);
+  ordersPushWindowDripStart(3, 0);
 
-  // Keep L1 auto-next on; capped by genLevel vs L1_GEN_CAP
   g_autoNextL1 = true;
-
   g_gameTickDueAt = millis() + 200;
+
   Serial.println("game: START");
   gamePrintStatus();
 }
@@ -905,11 +934,15 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     // Tell the house the verdict
     sendDeliverResult(s->house_id, (reason == DR_OK), reason);
 
-    // On success: clear that box’s ingredients and trigger auto-next flow
+    // Apply outcome
     if (reason == DR_OK) {
-      ingrClearTag(s->uid, s->uid_len);     // <— clear toppings + broadcast snapshot
-      gameOnOk(s->house_id);                // <— score/level counters
-      onDeliveredOk(s->house_id);           // <— remove order, maybe create+arm next
+      // Success: clear tag + score/progress
+      ingrClearTag(s->uid, s->uid_len);
+      gameOnOk(s->house_id);
+      onDeliveredOk(s->house_id);
+    } else {
+      // NEW: any wrong delivery costs a life
+      gameLoseLife(reason);
     }
     return;
   }

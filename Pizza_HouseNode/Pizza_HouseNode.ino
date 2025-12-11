@@ -59,33 +59,50 @@ Adafruit_NeoPixel strip(LED_COUNT, PIN_WS2812, NEO_GRB + NEO_KHZ800);
 // --- Beep buffer (22050 Hz, ~200ms, 1kHz sine) ---
 static int16_t beepBuf[4410/2]; // ~200 ms (~22050*0.2) -> 4410 samples; halve for size
 
-
-// Write a 16-bit mono 22,050 Hz WAV file with a simple sine beep
+// Smooth 16-bit mono WAV @ 22,050 Hz with fade in/out + tiny silence tail
 static bool writeBeepWav(const char* path, float freq_hz, uint16_t ms, uint8_t amplitude /*0..255*/) {
   const uint32_t sr = 22050;
-  const uint32_t samples = (sr * ms) / 1000;
+  uint32_t samples = (sr * ms) / 1000;
+  if (samples < 10) samples = 10;
+
+  // ~6 ms fade to kill clicks
+  const uint32_t fadeMs = 6;
+  uint32_t fade = (sr * fadeMs) / 1000;
+  if (fade*2 >= samples) fade = samples/4;   // guard for very short clips
+
+  // add a 3 ms silence tail to avoid pop at file end
+  const uint32_t tailSilence = (sr * 3) / 1000;
+
+  // amplitude with headroom (prevent inter-sample clipping)
+  const float amp = (amplitude / 255.0f) * 28000.0f;  // ~-2.3 dBFS headroom
+
   File f = LittleFS.open(path, FILE_WRITE);
   if (!f) return false;
 
-  // WAV header (PCM, 16-bit mono)
-  uint32_t dataBytes = samples * 2;
-  uint32_t riffSize  = 36 + dataBytes;
+  // WAV header
+  const uint32_t dataBytes = (samples + tailSilence) * 2;
+  const uint32_t riffSize  = 36 + dataBytes;
   auto w16=[&](uint16_t v){ f.write((uint8_t*)&v,2); };
   auto w32=[&](uint32_t v){ f.write((uint8_t*)&v,4); };
-
   f.write((const uint8_t*)"RIFF",4); w32(riffSize);
   f.write((const uint8_t*)"WAVE",4);
   f.write((const uint8_t*)"fmt ",4); w32(16); w16(1); w16(1); w32(sr); w32(sr*2); w16(2); w16(16);
   f.write((const uint8_t*)"data",4); w32(dataBytes);
 
-  // Samples
-  const float twoPiF = 2.0f * 3.14159265f * freq_hz;
-  for (uint32_t i=0;i<samples;i++){
-    float t = (float)i / (float)sr;
-    float s = sinf(twoPiF * t);
-    int16_t v = (int16_t)((int)(amplitude) * 128 * s); // ~ -12 dBFS at amplitude=180
+  // Samples with linear fade in/out (zero phase so start at 0)
+  const float omega = 2.0f * 3.14159265f * freq_hz / sr;
+  for (uint32_t i=0; i<samples; ++i) {
+    float env = 1.0f;
+    if (i < fade)            env = (float)i / (float)fade;                 // fade-in
+    else if (i > samples-fade) env = (float)(samples-i) / (float)fade;     // fade-out
+    float s = sinf(omega * i) * env;
+    int16_t v = (int16_t)(amp * s);
     f.write((uint8_t*)&v, 2);
   }
+  // silence tail
+  int16_t z = 0;
+  for (uint32_t i=0; i<tailSilence; ++i) f.write((uint8_t*)&z, 2);
+
   f.close();
   return true;
 }
