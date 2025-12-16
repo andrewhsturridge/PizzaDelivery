@@ -23,6 +23,26 @@ static char g_otaVer[12]  = {0};
 
 // Dedupe to avoid log/render spam
 static char g_lastShown[PZ_ORDER_TEXT_MAX] = {0};
+static bool g_lastRed = false;
+
+// OrdersStation prefixes timer as: "NNs <text>" (e.g., "09s Deliver...")
+// Parse that prefix so we can switch color to red when <=10s.
+static bool parseRemainPrefix(const char* s, uint16_t& outSec){
+  if (!s) return false;
+  uint32_t v = 0;
+  uint8_t n = 0;
+  const char* p = s;
+  while (*p >= '0' && *p <= '9' && n < 3) {
+    v = (v * 10U) + (uint32_t)(*p - '0');
+    p++; n++;
+  }
+  if (n == 0) return false;
+  if (*p != 's') return false;
+  p++;
+  if (*p != ' ') return false;
+  outSec = (uint16_t)((v > 65535U) ? 65535U : v);
+  return true;
+}
 
 static void sendHello(){
   HelloPayload hp{}; strlcpy(hp.fw, PizzaIdentity::fw(), sizeof(hp.fw));
@@ -49,22 +69,42 @@ static bool matchOtaTarget(const OtaStartPayload* p){
 
 // Signature matches PizzaNow::RxHandler
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t /*srcMac*/[6]){
-  if (hdr.type == HELLO_REQ){ 
+  if (hdr.type == HELLO_REQ){
     uint32_t jitter = 50 + (esp_random() % 300);           // 50..350 ms
     g_helloDueAt = millis() + jitter + ((PIZZA_HOUSE_ID & 7) * 40);
     return;
-   }
+  }
 
   if (hdr.type == ORDER_SHOW_TEXT && !g_inOta && len >= sizeof(PzOrderShowTextPayload)) {
     const auto* p = (const PzOrderShowTextPayload*)payload;
 
-    // De-dupe: only redraw/log when the text actually changes
-    if (strncmp(g_lastShown, p->text, sizeof(g_lastShown)) != 0) {
+    // If OrdersStation prefixed "NNs ", turn red at <=10s.
+    uint16_t sec = 0;
+    bool hasPrefix = parseRemainPrefix(p->text, sec);
+    bool wantRed = hasPrefix && (sec <= 10);
+
+    bool textChanged  = (strncmp(g_lastShown, p->text, sizeof(g_lastShown)) != 0);
+    bool colorChanged = (wantRed != g_lastRed);
+
+    // De-dupe: redraw when text OR color state changes
+    if (textChanged || colorChanged) {
+      if (wantRed) {
+        PizzaPanel::setColor(255, 0, 0);
+      } else {
+        PizzaPanel::setColor(0, 160, 255); // default blue
+      }
+      g_lastRed = wantRed;
+
       strlcpy(g_lastShown, p->text, sizeof(g_lastShown));
       PizzaPanel::setWeight(0);  // 1 is subtle bold
-      // EXACT look as HousePanels: style=0 (scroll), speed=2, bright=100
+      // Match HousePanels feel: speed=2, bright=100. Style left as-is (2) to match prior behavior.
       PizzaPanel::showText(p->text, /*style*/2, /*speed*/2, /*bright*/100);
-      PZ_LOGI("SHOW_TEXT: \"%s\"", p->text);
+
+      if (hasPrefix) {
+        PZ_LOGI("SHOW_TEXT: \"%s\" (t=%us %s)", p->text, (unsigned)sec, wantRed ? "RED" : "BLUE");
+      } else {
+        PZ_LOGI("SHOW_TEXT: \"%s\"", p->text);
+      }
     }
     return;
   }
@@ -103,7 +143,6 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     esp_restart();
     return;
   }
-
 }
 
 void setup(){
@@ -115,8 +154,9 @@ void setup(){
     PZ_LOGE("Panel init failed");
   }
 
-  PizzaPanel::setColor(0, 160, 255);  // **blue** (RGB)
-  
+  PizzaPanel::setColor(0, 160, 255);  // default blue (RGB)
+  g_lastRed = false;
+
   // Boot banner via the same helper
   PizzaPanel::showText("BOOT", /*style*/0, /*speed*/2, /*bright*/100);
 

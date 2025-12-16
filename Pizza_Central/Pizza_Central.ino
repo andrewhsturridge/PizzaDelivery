@@ -17,6 +17,7 @@
 #include "PizzaUtils.h"
 #include "BuildConfig.h"
 #include "PizzaNetCfg.h"
+#include "PizzaGameEngine.h"
 
 static uint16_t g_seq = 1;
 static Preferences s_prefsBoxes;
@@ -38,6 +39,22 @@ static uint8_t  g_tagCount = 0;
 static PzOrderItemSetPayload g_orders[PZ_ORDERS_MAX];
 static uint8_t g_orderCount = 0;
 static uint16_t g_seq_orders = 1;
+
+// --- New mapping-first game engine (levels 1..5, always-on identities, per-order timers) ---
+static PizzaGameEngine g_engine;
+
+// For status printing only (must match PizzaGameEngine::levelCfg)
+static uint16_t quotaForLevel(uint8_t lvl) {
+  switch (lvl) {
+    default:
+    case 1: return 4;
+    case 2: return 4;
+    case 3: return 5;
+    case 4: return 6;
+    case 5: return 6;
+  }
+}
+
 
 // Topping map 
 static const uint8_t kTopBits[5]  = {0x01, 0x02, 0x04, 0x08, 0x10};
@@ -101,7 +118,7 @@ struct GameState {
   /*livesMax*/5,       // default lives
   /*livesLeft*/5,      // initialized to livesMax at start
   /*okTotal*/0, /*okLevel*/0, /*score*/0,
-  /*duration*/180000, /*startedAt*/0, /*endsAt*/0,
+  /*duration*/360000, /*startedAt*/0, /*endsAt*/0,
   /*genLevel*/0
 };
 
@@ -136,13 +153,26 @@ static void gameResetOrdersAndMasks(){
 }
 
 // Print status (now includes lives)
+// Print status (engine-backed)
 static void gamePrintStatus(){
   uint32_t now = millis();
-  int32_t remaining = (g_game.phase==GP_RUNNING)? (int32_t)(g_game.endsAt - now) : 0;
-  Serial.printf("game: phase=%s level=%u lives=%u/%u score=%lu okLevel=%u/%u okTotal=%u timeLeft=%ldms\n",
-    (g_game.phase==GP_IDLE?"IDLE":(g_game.phase==GP_RUNNING?"RUNNING":"OVER")),
-    g_game.level, g_game.livesLeft, g_game.livesMax,
-    (unsigned long)g_game.score, g_game.okLevel, g_game.targetOK, g_game.okTotal, (long)remaining);
+
+  // phase + timer
+  const bool running = (g_game.phase == GP_RUNNING) && (g_engine.phase() == PizzaGameEngine::Phase::Running);
+  int32_t remaining = running ? (int32_t)(g_game.endsAt - now) : 0;
+  if (remaining < 0) remaining = 0;
+
+  uint8_t lvl = g_engine.level();
+  uint16_t q  = quotaForLevel(lvl);
+
+  Serial.printf("game: phase=%s level=%u lives=%u/%u okLevel=%u/%u okTotal=%u timeLeft=%ldms\n",
+    (running ? "RUNNING" : (g_game.phase==GP_IDLE ? "IDLE" : "OVER")),
+    (unsigned)lvl,
+    (unsigned)g_engine.livesLeft(), (unsigned)g_engine.livesMax(),
+    (unsigned)g_engine.successInLevel(), (unsigned)q,
+    (unsigned)g_engine.successTotal(),
+    (long)remaining
+  );
 }
 
 // Lose one life (end game if hits 0)
@@ -158,72 +188,80 @@ static void gameLoseLife(uint8_t reason){
   }
 }
 
-static void gameStart(uint16_t minutes, uint8_t level){
-  if (minutes==0) minutes = 3;
-  if (level==0)   level = 1;
-  g_game.phase = GP_RUNNING;
-  g_game.level = level;
-  g_game.okLevel = 0;
-  g_game.okTotal = 0;
-  g_game.score   = 0;
+static void gameStart(uint16_t minutes, uint8_t /*level*/){
+  // Level is owned by PizzaGameEngine; we always start at level 1 for real runs.
+  // Minutes is the global run cap (players only reach full duration when mastered).
+  if (minutes == 0) minutes = (uint16_t)(g_game.durationMs / 60000UL);
+  if (minutes == 0) minutes = 6;
+
+  const uint32_t now = millis();
+
+  g_game.phase      = GP_RUNNING;
   g_game.durationMs = (uint32_t)minutes * 60UL * 1000UL;
-  g_game.startedAt  = millis();
-  g_game.endsAt     = g_game.startedAt + g_game.durationMs;
-  g_game.genLevel   = 0;
+  g_game.startedAt  = now;
+  g_game.endsAt     = now + g_game.durationMs;
 
-  // Lives
-  if (g_game.livesMax == 0) g_game.livesMax = 5;
-  g_game.livesLeft = g_game.livesMax;
-
-  // >>> Reset any remembered toppings from previous sessions <<<
+  // Reset ingredient cache so old pizzas don't carry into a new run
   ingredientsResetAll();
 
-  // Fresh numbers + panels
-  ordersAssignNumbers(esp_random());
-  housesNumbersShow();
+  // Clear any legacy validators / lists
+  gameResetOrdersAndMasks();
 
-  // Fresh list + masks
-  ordersResetLocal();
+  // Lives for this run (per-game lives)
+  if (g_game.livesMax == 0) g_game.livesMax = 5;
+  g_engine.setLivesMax(g_game.livesMax);
 
-  // Seed orders
-  uint8_t seeds = (g_game.level==1 ? L1_SEED_ORDERS : 1);
-  for (uint8_t i=0; i<seeds; ++i) if (ordersGenLevel1()) ++g_game.genLevel;
+  // Start engine (build house identities + spawn initial orders)
+  g_engine.startGame(now);
 
-  // Arm & push once
-  armAllOrdersFromLocal();
-  ordersPushWindowDripStart(3, 0);
+  // Broadcast first order window (OrdersStation will start countdown from remain_s)
+  ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
 
-  g_autoNextL1 = true;
-  g_gameTickDueAt = millis() + 200;
+  g_gameTickDueAt = now + 100;
 
   Serial.println("game: START");
   gamePrintStatus();
 }
 
+static void housesStopBeacons(){
+  // Stop window + speaker identities (leave panels as-is unless you want to blank them)
+  for (uint8_t h=1; h<=6; ++h){
+    sendHouseDigital(h,
+      /*flags*/0x01 | 0x04,
+      /*win*/WIN_FX_OFF, 0,0,0,0,
+      /*panel*/PANEL_MODE_TEXT, "", 1,1,0,
+      /*spk*/0, 0, false, /*stopNow*/true
+    );
+  }
+}
+
 static void gameStop(){
   if (g_game.phase == GP_IDLE) return;
+
+  const uint32_t now = millis();
+
   g_game.phase = GP_OVER;
-  // Clear list; OrderStation will show "NO ORDERS"
-  gameResetOrdersAndMasks();
-  ordersPushAll();
-  // Also clear all remembered toppings at game end
+
+  // Stop engine + clear active orders
+  g_engine.stopGame(now);
+
+  // Clear list on OrdersStation
+  ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
+
+  // Stop identity beacons (window/sound)
+  housesStopBeacons();
+
+  // Also clear remembered toppings at game end
   ingredientsResetAll();
+
   Serial.println("game: STOP");
   gamePrintStatus();
 }
 
 static void gameNextLevel(){
-  if (g_game.phase != GP_RUNNING) return;
-  g_game.level++;
-  g_game.okLevel = 0;
-  // reset list and seed one order for the new level (for now: still L1 generator)
-  gameResetOrdersAndMasks();
-  if (ordersGenLevel1()) {
-    const auto &it = g_orders[g_orderCount-1];
-    g_orderMask[it.house_id] = it.mask;
-  }
-  ordersPushAll();
-  Serial.printf("game: NEXT -> level=%u\n", g_game.level);
+  // NOTE: With PizzaGameEngine, levels advance automatically based on per-level quotas.
+  // Keeping this CLI hook as a debug affordance; for now it just prints state.
+  Serial.println("game next: (engine) levels auto-advance; use deliveries to progress");
   gamePrintStatus();
 }
 
@@ -239,12 +277,30 @@ static void gameOnOk(uint8_t /*houseId*/){
 }
 
 static void gameTick(){
-  uint32_t now = millis();
+  const uint32_t now = millis();
   if ((int32_t)(now - g_gameTickDueAt) < 0) return;
-  g_gameTickDueAt = now + 200; // 5 Hz is plenty
+  g_gameTickDueAt = now + 100; // 10 Hz
 
-  if (g_game.phase == GP_RUNNING && (int32_t)(now - g_game.endsAt) >= 0) {
+  if (g_game.phase != GP_RUNNING) return;
+
+  // Global run cap
+  if ((int32_t)(now - g_game.endsAt) >= 0) {
     Serial.println("game: TIME UP");
+    gameStop();
+    return;
+  }
+
+  // Engine tick (handles per-order expiry + refills + auto level-up)
+  const bool changed = g_engine.tick(now);
+
+  // If orders changed (expiry/refill/level-up), push window to OrdersStation
+  if (changed) {
+    ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
+  }
+
+  // Engine might end the game (out of lives, completed final level)
+  if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
+    Serial.println("game: ENGINE END");
     gameStop();
   }
 }
@@ -279,6 +335,9 @@ static void ordersPushWindowDripTick() {
     Serial.println("[central] DRIP done");
     return;
   }
+
+  // Update remaining seconds right before sending (v2 timers)
+  g_engine.prepareOrderBroadcast(millis());
 
   // Prepare the current item (rebase index 0..window-1)
   PzOrderItemSetPayload it = g_orders[s_ordersDrip.idx];
@@ -364,6 +423,8 @@ static void ordersResetLocal() {
     g_orders[i].index = i;
     g_orders[i].house_id = 0;
     g_orders[i].mask = 0;
+    g_orders[i].order_id = 0;
+    g_orders[i].remain_s = 0;
     memset(g_orders[i].text, 0, sizeof(g_orders[i].text));
   }
 }
@@ -374,6 +435,8 @@ static bool ordersAddLocal(uint8_t house_id, uint8_t mask, const char* text) {
   it.index = g_orderCount;
   it.house_id = house_id;
   it.mask = mask;
+  it.order_id = 0;
+  it.remain_s = 0;
   memset(it.text, 0, sizeof(it.text));
   if (text && *text) strncpy(it.text, text, sizeof(it.text)-1);
   g_orderCount++;
@@ -751,7 +814,9 @@ static void ordersPushAll() {
   ordersSendReset(g_orderCount);
   delay(8); // small gap helps ESPNOW
 
-  // 2) ITEMS, with a tiny gap; optionally retransmit each once
+  // 2) ITEMS
+  g_engine.prepareOrderBroadcast(millis()); // v2 timers
+
   for (uint8_t i = 0; i < g_orderCount; ++i) {
     ordersSendItem(g_orders[i]);
     delay(6); // 4–10 ms is enough in practice
@@ -763,6 +828,8 @@ static void ordersPushWindow(uint8_t maxDisplay) {
 
   ordersSendReset(window);
   delay(8); // small gap helps on ESPNOW
+
+  g_engine.prepareOrderBroadcast(millis()); // v2 timers
 
   for (uint8_t i = 0; i < window; ++i) {
     PzOrderItemSetPayload it = g_orders[i]; // take first 'window' items
@@ -917,18 +984,39 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       // continue to normal validation
     }
 
+    const uint32_t nowMs = millis();
+
     uint8_t reason = DR_OK;
-    uint8_t order  = g_orderMask[s->house_id];
+    uint8_t tagMask = 0;
 
     // 1) must be whitelisted
     if (!isWhitelisted(s->uid, s->uid_len)) {
       reason = DR_UNKNOWN_PIZZA;
     } else {
       // 2) must have ingredient mask cached
-      int idx = tagFind(s->uid, s->uid_len);
-      if (idx < 0)                      reason = DR_UNKNOWN_PIZZA;
-      else if (order == MASK_NONE)      reason = DR_NO_ORDER;
-      else if (g_tags[idx].mask != order) reason = DR_WRONG_PIZZA;
+      int tidx = tagFind(s->uid, s->uid_len);
+      if (tidx < 0) {
+        reason = DR_UNKNOWN_PIZZA;
+      } else {
+        tagMask = g_tags[tidx].mask;
+      }
+    }
+
+    // 3) must match an active order (engine when running; legacy per-house mask otherwise)
+    if (reason == DR_OK) {
+      if (g_game.phase == GP_RUNNING && g_engine.phase() == PizzaGameEngine::Phase::Running) {
+        int8_t oidx = g_engine.findActiveOrderIndexByHouse(s->house_id);
+        if (oidx < 0) {
+          reason = DR_NO_ORDER;
+        } else if (!g_engine.validateToppingsForOrderIndex((uint8_t)oidx, tagMask)) {
+          reason = DR_WRONG_PIZZA;
+        }
+      } else {
+        // Legacy validator (manual testing without engine)
+        uint8_t expected = g_orderMask[s->house_id];
+        if (expected == MASK_NONE)      reason = DR_NO_ORDER;
+        else if (tagMask != expected)  reason = DR_WRONG_PIZZA;
+      }
     }
 
     // Tell the house the verdict
@@ -936,13 +1024,34 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 
     // Apply outcome
     if (reason == DR_OK) {
-      // Success: clear tag + score/progress
+      // Success: clear tag ingredients + advance engine
       ingrClearTag(s->uid, s->uid_len);
-      gameOnOk(s->house_id);
-      onDeliveredOk(s->house_id);
+
+      if (g_game.phase == GP_RUNNING && g_engine.phase() == PizzaGameEngine::Phase::Running) {
+        bool changed = g_engine.onDeliveryResult(s->house_id, /*ok*/true, reason, nowMs);
+        if (changed) {
+          ordersPushWindowDripStart(/*maxDisplay*/3, ORD_DRIP_START_DELAY_MS);
+        }
+        // If that delivery completed the game (final level), stop cleanly
+        if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
+          gameStop();
+        }
+      }
+
     } else {
-      // NEW: any wrong delivery costs a life
-      gameLoseLife(reason);
+      // Wrong delivery costs a life only when a run is active
+      if (g_game.phase == GP_RUNNING && g_engine.phase() == PizzaGameEngine::Phase::Running) {
+        bool changed = g_engine.onDeliveryResult(s->house_id, /*ok*/false, reason, nowMs);
+        if (changed) {
+          ordersPushWindowDripStart(/*maxDisplay*/3, ORD_DRIP_START_DELAY_MS);
+        }
+        if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
+          gameStop();
+        }
+      } else {
+        // legacy: uses central's life counter (if any)
+        gameLoseLife(reason);
+      }
     }
     return;
   }
@@ -1053,13 +1162,14 @@ static void printHelp() {
 
   // Game
   Serial.println(F("Game"));
-  Serial.println(F("  game start [minutes] [level]   Start a timed game (default 3 1)"));
+  Serial.println(F("  game start [minutes]           Start a timed run (default from `game minutes`, initial 6)"));
   Serial.println(F("  game stop                      End game and clear orders"));
   Serial.println(F("  game status                    Print current game state"));
-  Serial.println(F("  game next                      Advance to next level"));
-  Serial.println(F("  game target <n>                Set OKs needed to complete level"));
-  Serial.println(F("  game auto on|off               Auto-advance on target reached"));
-  Serial.println(F("  game minutes <n>               Default duration for next start"));
+  Serial.println(F("  game next                      Debug: print status (levels auto-advance)"));
+  Serial.println(F("  (levels auto-advance via engine quotas; no target/auto knobs in CLI yet)"));
+  // (engine handles auto-advance)
+
+  Serial.println(F("  game minutes <n>               Set default run duration (minutes)"));
   Serial.println();
 
   // Delivery Validator (per-house mask)
@@ -1102,6 +1212,13 @@ void setup() {
 
   stateInit();
   boxesLoad();
+
+  // Engine init (binds ORDER_ITEM_SET payload buffer)
+  PizzaGameEngine::IO io{};
+  io.sendHouseDigital = sendHouseDigital;
+  io.rand32 = []()->uint32_t { return esp_random(); };
+  g_engine.begin(io);
+  g_engine.bindOrdersBuffer(g_orders, PZ_ORDERS_MAX, &g_orderCount);
 
   // Help
   Serial.println(F("Type 'help' for commands."));
@@ -1484,13 +1601,15 @@ void loop() {
   // game start [minutes] [level]
   if (line.startsWith("game start")){
     String rest = line.substring(10); rest.trim();
-    int minutes = 3, lvl = 1;
+    int minutes = (int)(g_game.durationMs / 60000UL);
+    if (minutes <= 0) minutes = 6;
+    int lvl = 1;
     if (rest.length()){
       int sp = rest.indexOf(' ');
       if (sp<0) { minutes = rest.toInt(); }
       else { minutes = rest.substring(0,sp).toInt(); lvl = rest.substring(sp+1).toInt(); }
     }
-    if (minutes <= 0) minutes = 3;
+    if (minutes <= 0) minutes = 6;
     if (lvl <= 0)     lvl = 1;
     gameStart((uint16_t)minutes, (uint8_t)lvl);
     return;
@@ -1500,9 +1619,9 @@ void loop() {
   // game next  -> advance to next level (manual)
   if (line == "game next"){ gameNextLevel(); return; }
   // game target <n>  -> how many OKs to consider a level "complete"
-  if (line.startsWith("game target ")){ int n=line.substring(12).toInt(); if (n>0 && n<99) g_game.targetOK=n; gamePrintStatus(); return; }
+  if (line.startsWith("game target ")){ Serial.println("game target: handled by engine quotas (no-op)"); gamePrintStatus(); return; }
   // game auto on|off -> auto advance level when target reached
-  if (line.startsWith("game auto ")){ String v=line.substring(10); v.trim(); g_game.autoAdvance=(v=="on"); gamePrintStatus(); return; }
+  if (line.startsWith("game auto ")){ Serial.println("game auto: engine always auto-advances (no-op)"); gamePrintStatus(); return; }
   // game minutes <n> -> change duration for next start
   if (line.startsWith("game minutes ")){ int m=line.substring(13).toInt(); if (m>0) g_game.durationMs=(uint32_t)m*60UL*1000UL; return; }
   // net show

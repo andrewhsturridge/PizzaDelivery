@@ -143,6 +143,13 @@ static uint32_t g_nextFxAt = 0;     // scheduling for rainbow/party
 
 static TaskHandle_t g_audioTask = nullptr;
 
+// --- Speaker identity beacon (quiet periodic audio) ---
+static bool     g_beaconEnabled   = false;
+static uint8_t  g_beaconClip      = 0;
+static uint8_t  g_beaconVol       = 70;
+static uint32_t g_beaconPeriodMs  = 2600;   // base period between beacons
+static uint32_t g_beaconNextAt    = 0;
+
 // Forward declares
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t srcMac[6]);
 
@@ -421,13 +428,38 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       }
 
       // Speaker (FS-based audio)
+      // NOTE: To avoid audio overload, we interpret spk_flags bit0 as
+      // "beacon identity enabled" (periodic playback), NOT a continuous loop.
       if (p->flags & 0x04) {
         if (p->spk_flags & 0x02) {
+          // stop + disable beacon
+          g_beaconEnabled = false;
+          g_beaconClip = 0;
           PizzaAudioFS::stop();
         } else {
           PizzaAudioFS::setVolume(p->spk_vol);
-          if (!PizzaAudioFS::playClip(p->spk_clip, (p->spk_flags & 0x01))) {
-            Serial.printf("[House %u] Missing /clips/%03u.wav – no audio\n", g_houseId, p->spk_clip);
+
+          // clip 0 means "silent"
+          if (p->spk_clip == 0) {
+            g_beaconEnabled = false;
+            g_beaconClip = 0;
+            PizzaAudioFS::stop();
+          } else if (p->spk_flags & 0x01) {
+            // Beacon mode: play briefly every few seconds (staggered per house)
+            g_beaconEnabled = true;
+            g_beaconClip = p->spk_clip;
+            g_beaconVol  = p->spk_vol;
+
+            uint32_t now = millis();
+            uint32_t jitter = (uint32_t)(esp_random() % 160); // 0..159ms
+            g_beaconNextAt = now + 200 + (uint32_t)g_houseId * 180 + jitter;
+          } else {
+            // One-shot play (no beacon)
+            g_beaconEnabled = false;
+            g_beaconClip = 0;
+            if (!PizzaAudioFS::playClip(p->spk_clip, /*loop=*/false)) {
+              Serial.printf("[House %u] Missing /clips/%03u.wav – no audio\n", g_houseId, p->spk_clip);
+            }
           }
         }
       }
@@ -710,6 +742,26 @@ void loop() {
       strip.show(); PizzaAudioFS::loop();
       uint16_t pace = 40 + (255 - g_winSpd); // faster with higher speed
       g_nextFxAt = now + pace;
+    }
+  }
+
+
+  // --- Speaker identity beacon tick (quiet periodic) ---
+  if (g_beaconEnabled && g_beaconClip != 0) {
+    if ((int32_t)(now - g_beaconNextAt) >= 0) {
+      // Don't interrupt result beeps or any currently playing clip
+      if (!PizzaAudioFS::isPlaying()) {
+        PizzaAudioFS::setVolume(g_beaconVol);
+        if (!PizzaAudioFS::playClip(g_beaconClip, /*loop=*/false)) {
+          Serial.printf("[House %u] beacon missing /clips/%03u.wav – beacon off\n", g_houseId, g_beaconClip);
+          g_beaconEnabled = false;
+          g_beaconClip = 0;
+        } else {
+          // Keep houses naturally de-synced over time
+          uint32_t jitter = (uint32_t)(esp_random() % 250); // 0..249ms
+          g_beaconNextAt = now + g_beaconPeriodMs + jitter;
+        }
+      }
     }
   }
 
