@@ -4,6 +4,7 @@
 #define PIZZA_ROLE HOUSE_PANEL
 
 #include <Arduino.h>
+#include <ctype.h>
 #include <Preferences.h>
 #include "PizzaProtocol.h"
 #include "PizzaNow.h"
@@ -64,6 +65,150 @@ static void showStatus() {
   }
 }
 
+
+// -----------------------------
+// Icon rendering (Panel T2)
+// We treat any text that starts with '@' as an icon token.
+// Example tokens: "@STAR", "@HEART", "@KEY".
+// -----------------------------
+
+static bool isIconText(const char* s) {
+  return s && s[0] == '@' && s[1] != '\0';
+}
+
+static bool tokenEq(const char* a, const char* b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    char ca = toupper((unsigned char)*a++);
+    char cb = toupper((unsigned char)*b++);
+    if (ca != cb) return false;
+  }
+  return *a == 0 && *b == 0;
+}
+
+static void drawIcon(const char* tok) {
+  // 64x32 coordinate system
+  auto& g = PizzaPanel::gfx();
+  const uint16_t WHITE = 0xFFFF;
+
+  // Icon box
+  const int cx = 32;
+  const int cy = 16;
+  const int r  = 10;
+
+  // Normalize token (skip leading '@')
+  const char* t = tok;
+  if (t && t[0] == '@') t++;
+
+  // Simple primitives; readable from across the room.
+  if (tokenEq(t, "STAR")) {
+    // Asterisk-like star
+    g.drawLine(cx-r, cy, cx+r, cy, WHITE);
+    g.drawLine(cx, cy-r, cx, cy+r, WHITE);
+    g.drawLine(cx-r, cy-r, cx+r, cy+r, WHITE);
+    g.drawLine(cx-r, cy+r, cx+r, cy-r, WHITE);
+  }
+  else if (tokenEq(t, "HEART")) {
+    g.fillCircle(cx-5, cy-3, 5, WHITE);
+    g.fillCircle(cx+5, cy-3, 5, WHITE);
+    g.fillTriangle(cx-10, cy-1, cx+10, cy-1, cx, cy+12, WHITE);
+  }
+  else if (tokenEq(t, "CROWN")) {
+    g.drawRect(cx-14, cy+4, 28, 6, WHITE);
+    g.fillTriangle(cx-14, cy+4, cx-6, cy-6, cx+2, cy+4, WHITE);
+    g.fillTriangle(cx-2,  cy+4, cx+6, cy-8, cx+14, cy+4, WHITE);
+    g.fillTriangle(cx+2,  cy+4, cx+10, cy-6, cx+18, cy+4, WHITE);
+  }
+  else if (tokenEq(t, "BOLT") || tokenEq(t, "LIGHTNING")) {
+    // Zig-zag lightning
+    g.drawLine(cx-4, cy-12, cx+2, cy-2, WHITE);
+    g.drawLine(cx+2, cy-2,  cx-2, cy-2, WHITE);
+    g.drawLine(cx-2, cy-2,  cx+4, cy+12, WHITE);
+    g.drawLine(cx+4, cy+12, cx-1, cy+4, WHITE);
+  }
+  else if (tokenEq(t, "SKULL")) {
+    g.drawCircle(cx, cy-2, 10, WHITE);
+    g.fillCircle(cx-4, cy-4, 2, WHITE);
+    g.fillCircle(cx+4, cy-4, 2, WHITE);
+    g.drawRect(cx-6, cy+5, 12, 5, WHITE);
+    g.drawLine(cx-2, cy+5, cx-2, cy+10, WHITE);
+    g.drawLine(cx+2, cy+5, cx+2, cy+10, WHITE);
+  }
+  else if (tokenEq(t, "KEY")) {
+    g.drawCircle(cx-6, cy-2, 5, WHITE);
+    g.drawLine(cx-1, cy-2, cx+12, cy-2, WHITE);
+    g.drawLine(cx+6, cy-2, cx+6, cy+4, WHITE);
+    g.drawLine(cx+10, cy-2, cx+10, cy+2, WHITE);
+  }
+  else if (tokenEq(t, "SMILE")) {
+    g.drawCircle(cx, cy-2, 11, WHITE);
+    g.fillCircle(cx-4, cy-6, 1, WHITE);
+    g.fillCircle(cx+4, cy-6, 1, WHITE);
+    g.drawLine(cx-5, cy+2, cx+5, cy+2, WHITE);
+    g.drawLine(cx-4, cy+3, cx+4, cy+3, WHITE);
+  }
+  else if (tokenEq(t, "FROWN")) {
+    g.drawCircle(cx, cy-2, 11, WHITE);
+    g.fillCircle(cx-4, cy-6, 1, WHITE);
+    g.fillCircle(cx+4, cy-6, 1, WHITE);
+    g.drawLine(cx-5, cy+4, cx+5, cy+4, WHITE);
+    g.drawLine(cx-4, cy+3, cx+4, cy+3, WHITE);
+  }
+  else if (tokenEq(t, "UP")) {
+    g.fillTriangle(cx, cy-12, cx-10, cy, cx+10, cy, WHITE);
+    g.drawLine(cx, cy, cx, cy+10, WHITE);
+  }
+  else if (tokenEq(t, "DOWN")) {
+    g.fillTriangle(cx-10, cy-2, cx+10, cy-2, cx, cy+10, WHITE);
+    g.drawLine(cx, cy-12, cx, cy-2, WHITE);
+  }
+  else if (tokenEq(t, "CHECK")) {
+    g.drawLine(cx-10, cy, cx-2, cy+8, WHITE);
+    g.drawLine(cx-2,  cy+8, cx+12, cy-8, WHITE);
+    g.drawLine(cx-10, cy+1, cx-2, cy+9, WHITE);
+    g.drawLine(cx-2,  cy+9, cx+12, cy-7, WHITE);
+  }
+  else if (tokenEq(t, "X")) {
+    g.drawLine(cx-10, cy-10, cx+10, cy+10, WHITE);
+    g.drawLine(cx-10, cy+10, cx+10, cy-10, WHITE);
+  }
+  else {
+    // Unknown icon token -> show as text (fallback)
+    // (We do nothing here; caller will render as text.)
+  }
+}
+
+static void showIconText(const char* iconTok, uint8_t bright) {
+  // Stop any previous scroll, set brightness, clear, draw icon, show.
+  PizzaPanel::setColor(255,255,255);
+  PizzaPanel::showText("", /*style*/1, /*speed*/1, bright);
+  auto& g = PizzaPanel::gfx();
+  g.fillScreen(0);
+  drawIcon(iconTok);
+  PizzaPanel::show();
+}
+
+static void renderPanelText(const char* text, uint8_t style, uint8_t speed, uint8_t bright) {
+  if (isIconText(text)) {
+    // If token is unknown, drawIcon() draws nothing; fall back to text in that case.
+    const char* t = text;
+    if (t && t[0]=='@') {
+      // quick known-token check
+      const char* name = t + 1;
+      const char* known[] = {"STAR","HEART","CROWN","BOLT","LIGHTNING","SKULL","KEY","SMILE","FROWN","UP","DOWN","CHECK","X"};
+      bool ok=false;
+      for (auto k: known) { if (tokenEq(name, k)) { ok=true; break; } }
+      if (ok) {
+        showIconText(text, bright);
+        return;
+      }
+    }
+  }
+
+  // Default text rendering
+  PizzaPanel::showText(text ? text : "", style, speed, bright);
+}
+
 static bool matchOtaTarget(const OtaStartPayload* p) {
   if (p->target_role != (uint8_t)PIZZA_ROLE) return false;
   if (p->scope == 0) return true; // ALL
@@ -105,7 +250,7 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     if (p->house_id == g_houseId) {
       PZ_LOGI("PANEL_TEXT: id=%u \"%s\" style=%u speed=%u bright=%u",
               p->house_id, p->text, p->style, p->speed, p->bright);
-      PizzaPanel::showText(p->text, p->style, p->speed, p->bright);
+      renderPanelText(p->text, p->style, p->speed, p->bright);
     }
     return;
   }
@@ -129,7 +274,7 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 
     if (p->flags & 0x02) {
       if (p->panel_mode == PANEL_MODE_TEXT) {
-        PizzaPanel::showText(p->panel_text, p->panel_style, p->panel_speed, p->panel_bright);
+        renderPanelText(p->panel_text, p->panel_style, p->panel_speed, p->panel_bright);
       } else if (p->panel_mode == PANEL_MODE_NUMBER) {
         // numbers as static text (could add a big-digits mode later)
         PizzaPanel::showText(p->panel_text, /*style*/1, /*speed*/1, p->panel_bright);

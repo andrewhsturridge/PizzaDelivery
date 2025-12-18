@@ -17,7 +17,7 @@ static inline uint32_t msFromS(uint32_t s) { return s * 1000UL; }
 static const uint8_t kTopBits[5]  = {0x01, 0x02, 0x04, 0x08, 0x10};
 static const char*   kTopNames[5] = {"pepperoni","mushrooms","peppers","pineapple","ham"};
 
-// Window token catalog (minimal but expandable)
+// Window token catalog (expanded; keep tokens DISTINCT)
 struct WinTok {
   const char* token; // lower-case name used in clue text
   uint8_t fx;
@@ -25,6 +25,7 @@ struct WinTok {
   uint8_t speed;
 };
 
+// W1: solid colors (>=6 unique options)
 static const WinTok kWinSolids[] = {
   {"red",    WIN_FX_SOLID, 0,   255, 130, 0},
   {"blue",   WIN_FX_SOLID, 170, 255, 130, 0},
@@ -33,39 +34,133 @@ static const WinTok kWinSolids[] = {
   {"purple", WIN_FX_SOLID, 200, 255, 130, 0},
   {"cyan",   WIN_FX_SOLID, 120, 255, 130, 0},
   {"orange", WIN_FX_SOLID, 18,  255, 130, 0},
+  {"pink",   WIN_FX_SOLID, 235, 200, 130, 0},
+  {"white",  WIN_FX_SOLID, 0,   0,   200, 0},
 };
 
-static const WinTok kWinPatterns[] = {
-  // W2
-  {"disco",    WIN_FX_PARTY,   0, 200, 120, 220},
-  {"rainbow",  WIN_FX_RAINBOW, 0, 255, 120, 8},
-  // W3 direction-like variants using RAINBOW with speed sign encoded in uint8
-  // NOTE: HouseNode can treat speed >127 as negative steps for CCW.
-  {"chase cw",  WIN_FX_RAINBOW, 0, 255, 120, 10},
-  {"chase ccw", WIN_FX_RAINBOW, 0, 255, 120, 246},
+// W2: visually-distinct patterns (non-directional)
+static const WinTok kWinW2[] = {
+  {"disco",   WIN_FX_PARTY,      0, 200, 120, 220},
+  {"police",  WIN_FX_POLICE,     0,   0, 160, 200},
+  {"flicker", WIN_FX_FLICKER,   18, 255, 160, 190},
+  {"sparkle", WIN_FX_SPARKLE,    0,   0, 150, 180},
+  {"pulse",   WIN_FX_PULSE,    200, 255, 180, 170},
+  {"strobe",  WIN_FX_STROBE,     0,   0, 200, 210},
+  {"split",   WIN_FX_SPLIT_SWAP, 30, 255, 160, 120},
 };
+
+// W3: motion/direction patterns
+static const WinTok kWinW3[] = {
+  {"chase clockwise",        WIN_FX_CHASE_CW,   0, 255, 180, 170},
+  {"chase counter-clockwise",WIN_FX_CHASE_CCW,  0, 255, 180, 170},
+  {"bounce",                WIN_FX_BOUNCE,    120, 255, 180, 150},
+  {"wedge clockwise",        WIN_FX_WEDGE_CW,   85, 255, 180, 160},
+  {"wedge counter-clockwise",WIN_FX_WEDGE_CCW,  85, 255, 180, 160},
+};
+
+// -----------------------------
+// Sound token catalog
+// NOTE: Clip IDs must exist as /clips/XYZ.wav on the houses.
+// - S2 beep patterns (100..105) are generated on the houses at boot.
+// -----------------------------
+enum SoundCat : uint8_t { SC_ANIMAL=0, SC_ALERT=1, SC_PERSON=2, SC_INSTR=3 };
 
 struct SoundTok {
   const char* token; // lower-case name used in clue text
   uint8_t clip;
+  uint8_t cat;
 };
 
-// Minimal starter set. Clip IDs must exist on house nodes for sound to play.
 static const SoundTok kSoundS1[] = {
-  {"cat",      1},
-  {"dog",      2},
-  {"doorbell", 3},
-  {"alarm",    4},
-  {"music",    5},
-  {"baby",     6},
-  {"angry",    7},
-  {"beeps",    8},
+  // Animals
+  {"cat",        1,  SC_ANIMAL},
+  {"dog",        2,  SC_ANIMAL},
+  {"bird",       14, SC_ANIMAL},
+  {"frog",       15, SC_ANIMAL},
+
+  // Alerts / Household
+  {"doorbell",   3,  SC_ALERT},
+  {"fire alarm", 4,  SC_ALERT},
+  {"buzzer",     9,  SC_ALERT},
+  {"phone ring", 10, SC_ALERT},
+
+  // People
+  {"baby",       6,  SC_PERSON},
+  {"laugh",      13, SC_PERSON},
+  {"sneeze",     16, SC_PERSON},
+  {"angry",      7,  SC_PERSON},
+
+  // Instruments
+  {"drum",       17, SC_INSTR},
+  {"guitar",     11, SC_INSTR},
+  {"piano",      18, SC_INSTR},
+  {"trumpet",    12, SC_INSTR},
 };
 
+// S2: generated beep-pattern identities (HouseNode generates these: /clips/100..105.wav)
 static const SoundTok kSoundS2[] = {
-  {"double beep", 10},
-  {"triple beep", 11},
-  {"beep-long",   12},
+  {"double beep", 100, SC_ALERT},
+  {"triple beep", 101, SC_ALERT},
+  {"long beep",   102, SC_ALERT},
+  {"short-long",  103, SC_ALERT},
+  {"long-short",  104, SC_ALERT},
+  {"five fast",   105, SC_ALERT},
+};
+
+
+// -----------------------------
+// Panel token pools
+// - T1: numbers and easy names
+// - T2: equations, harder famous last names, and icons
+// NOTE: Avoid tokens that overlap with other domains (colors, etc.).
+// -----------------------------
+
+// T1 names (optional later; we keep Level 1/2 as numeric for now)
+static const char* kPanelNamesT1[] = {
+  "TESLA",
+  "JOBS",
+  "GATES",
+  "MUSK",
+  "BEZOS",
+  "JORDAN",
+  "SWIFT",
+  "DISNEY",
+  "MOZART",
+  "PICASSO",
+};
+
+// T2 names: famous but a bit harder/longer
+static const char* kPanelNamesT2[] = {
+  "EINSTEIN",
+  "NEWTON",
+  "CURIE",
+  "TURING",
+  "DARWIN",
+  "SHAKESPEARE",
+  "VANGOGH",
+  "BEETHOVEN",
+  "SPIELBERG",
+  "HITCHCOCK",
+  "FREUD",
+  "GALILEI",
+  "BECKHAM",
+  "CHAPLIN",
+};
+
+// T2 icons: rendered by HousePanel when text begins with '@'
+static const char* kPanelIconsT2[] = {
+  "@STAR",
+  "@HEART",
+  "@CROWN",
+  "@KEY",
+  "@BOLT",
+  "@SKULL",
+  "@SMILE",
+  "@FROWN",
+  "@UP",
+  "@DOWN",
+  "@CHECK",
+  "@X",
 };
 
 static const char* doorColorName(uint8_t dc) {
@@ -181,15 +276,23 @@ void PizzaGameEngine::setLivesMax(uint8_t livesMax) {
 }
 
 void PizzaGameEngine::startGame(uint32_t nowMs) {
+  startGameAtLevel(1, nowMs);
+}
+
+void PizzaGameEngine::startGameAtLevel(uint8_t startLvl, uint32_t nowMs) {
+  if (startLvl < 1) startLvl = 1;
+  if (startLvl > 5) startLvl = 5;
+
   m_phase = Phase::Running;
-  m_level = 1;
+  m_level = startLvl;
   m_livesLeft = m_livesMax;
   m_successInLevel = 0;
   m_successTotal   = 0;
   m_nextOrderId    = 1;
   m_spawnedThisLevel = 0;
   m_ordersDirty = true;
-  startLevel(1, nowMs);
+
+  startLevel(startLvl, nowMs);
 }
 
 void PizzaGameEngine::stopGame(uint32_t /*nowMs*/) {
@@ -462,19 +565,19 @@ void PizzaGameEngine::buildMappingForLevel(uint8_t lvl) {
     m_id[h].winV = 130;
   }
 
-  // Panel T1 unique numbers baseline
+  // ----- Panel baseline numbers (same as Level 1 original) -----
   char nums[7][8] = {{0}};
   makeUniqueNumbers(nums, m_io.rand32);
 
-  auto applyPanelT1 = [&](uint8_t h, const char* digits) {
+  auto applyPanelNumber = [&](uint8_t h, const char* digits) {
     m_id[h].panelMode = PANEL_MODE_NUMBER;
     strlcpy(m_id[h].panelText, digits, sizeof(m_id[h].panelText));
     strlcpy(m_id[h].panelToken, digits, sizeof(m_id[h].panelToken));
   };
-  auto applyPanelT2 = [&](uint8_t h, const char* expr) {
+  auto applyPanelText = [&](uint8_t h, const char* textTok) {
     m_id[h].panelMode = PANEL_MODE_TEXT;
-    strlcpy(m_id[h].panelText, expr, sizeof(m_id[h].panelText));
-    strlcpy(m_id[h].panelToken, expr, sizeof(m_id[h].panelToken));
+    strlcpy(m_id[h].panelText, textTok, sizeof(m_id[h].panelText));
+    strlcpy(m_id[h].panelToken, textTok, sizeof(m_id[h].panelToken));
   };
   auto applyWinTok = [&](uint8_t h, const WinTok& t) {
     m_id[h].winFx = t.fx;
@@ -491,46 +594,53 @@ void PizzaGameEngine::buildMappingForLevel(uint8_t lvl) {
     strlcpy(m_id[h].soundToken, s.token, sizeof(m_id[h].soundToken));
   };
 
-  // Select 6 distinct window solids indices
+  // Pick 6 distinct window solid indices
   uint8_t winIdx[6];
   {
     uint8_t poolN = (uint8_t)(sizeof(kWinSolids)/sizeof(kWinSolids[0]));
-    uint8_t pool[16];
+    uint8_t pool[32];
     for (uint8_t i=0;i<poolN;i++) pool[i]=i;
     shuffleU8(pool, poolN, m_io.rand32);
     for (uint8_t i=0;i<6;i++) winIdx[i]=pool[i];
   }
 
-  // Select 6 distinct sound indices
+  // Pick 6 distinct sound S1 indices
   uint8_t sndIdx[6];
   {
     uint8_t poolN = (uint8_t)(sizeof(kSoundS1)/sizeof(kSoundS1[0]));
-    uint8_t pool[16];
+    uint8_t pool[32];
     for (uint8_t i=0;i<poolN;i++) pool[i]=i;
     shuffleU8(pool, poolN, m_io.rand32);
     for (uint8_t i=0;i<6;i++) sndIdx[i]=pool[i];
   }
 
+  // -----------------------------
+  // Level recipes (Mapping-first)
+  // -----------------------------
+
   if (lvl == 1) {
-    // Panel: T1 all unique
-    for (uint8_t h=1; h<=6; ++h) applyPanelT1(h, nums[h]);
-    // Window: W1 all unique solids
+    // Panel: T1 numbers all unique
+    for (uint8_t h=1; h<=6; ++h) applyPanelNumber(h, nums[h]);
+
+    // Windows: W1 all unique solids
     for (uint8_t h=1; h<=6; ++h) applyWinTok(h, kWinSolids[winIdx[h-1]]);
+
     // Sound: S1 all unique
     for (uint8_t h=1; h<=6; ++h) applySoundTok(h, kSoundS1[sndIdx[h-1]], 70);
     return;
   }
 
   if (lvl == 2) {
-    // Panel: T1 all unique
-    for (uint8_t h=1; h<=6; ++h) applyPanelT1(h, nums[h]);
+    // Panel: T1 numbers all unique
+    for (uint8_t h=1; h<=6; ++h) applyPanelNumber(h, nums[h]);
 
-    // Default: windows unique + sounds unique
+    // Start with windows unique + sounds unique
     for (uint8_t h=1; h<=6; ++h) {
       applyWinTok(h, kWinSolids[winIdx[h-1]]);
       applySoundTok(h, kSoundS1[sndIdx[h-1]], 70);
     }
 
+    // Add a collision in ONE digital domain (2/2/1/1) to force composites sometimes
     bool soundCollision = ((rng() % 2) == 0);
     uint8_t hh[6] = {1,2,3,4,5,6};
     shuffleU8(hh, 6, m_io.rand32);
@@ -544,7 +654,7 @@ void PizzaGameEngine::buildMappingForLevel(uint8_t lvl) {
       applySoundTok(hh[4], kSoundS1[sndIdx[2]], 70);
       applySoundTok(hh[5], kSoundS1[sndIdx[3]], 70);
     } else {
-      // Window 2/2/1/1
+      // Windows 2/2/1/1
       applyWinTok(hh[0], kWinSolids[winIdx[0]]);
       applyWinTok(hh[1], kWinSolids[winIdx[0]]);
       applyWinTok(hh[2], kWinSolids[winIdx[1]]);
@@ -556,25 +666,67 @@ void PizzaGameEngine::buildMappingForLevel(uint8_t lvl) {
   }
 
   if (lvl == 3) {
-    // Panel: 3 T1 numbers, 3 T2 equations
+    // Panel: 3 T1 numbers, 3 T2 (1 equation, 1 name, 1 icon)
     uint8_t hh[6] = {1,2,3,4,5,6};
     shuffleU8(hh, 6, m_io.rand32);
-    bool isEq[7] = {0};
-    for (uint8_t i=0;i<3;i++) isEq[hh[i]] = true;
+    bool isT2[7] = {0};
+    for (uint8_t i=0;i<3;i++) isT2[hh[i]] = true;
 
-    char eqs[3][12];
-    makeUniqueEquations(eqs, 3, m_io.rand32);
-    uint8_t ei = 0;
+    // Prepare T2 items
+    char eqs[2][12];
+    makeUniqueEquations(eqs, 2, m_io.rand32);
 
-    for (uint8_t h=1; h<=6; ++h) {
-      if (isEq[h]) applyPanelT2(h, eqs[ei++]);
-      else applyPanelT1(h, nums[h]);
+    uint8_t nameIdx[2];
+    {
+      uint8_t poolN = (uint8_t)(sizeof(kPanelNamesT2)/sizeof(kPanelNamesT2[0]));
+      uint8_t pool[32];
+      for (uint8_t i=0;i<poolN;i++) pool[i]=i;
+      shuffleU8(pool, poolN, m_io.rand32);
+      nameIdx[0]=pool[0]; nameIdx[1]=pool[1];
     }
 
-    // Window: 1 disco, rest solids
-    uint8_t discoHouse = (uint8_t)(1 + (rng() % 6));
+    uint8_t iconIdx[2];
+    {
+      uint8_t poolN = (uint8_t)(sizeof(kPanelIconsT2)/sizeof(kPanelIconsT2[0]));
+      uint8_t pool[32];
+      for (uint8_t i=0;i<poolN;i++) pool[i]=i;
+      shuffleU8(pool, poolN, m_io.rand32);
+      iconIdx[0]=pool[0]; iconIdx[1]=pool[1];
+    }
+
+    // Assign the 3 T2 houses: shuffle which category goes where
+    uint8_t t2H[3];
+    uint8_t t2n=0;
+    for (uint8_t i=0;i<6;i++) if (isT2[hh[i]]) t2H[t2n++] = hh[i];
+    if (t2n != 3) { t2H[0]=hh[0]; t2H[1]=hh[1]; t2H[2]=hh[2]; }
+
+    // permute categories eq/name/icon
+    uint8_t cat[3] = {0,1,2};
+    shuffleU8(cat, 3, m_io.rand32);
+
     for (uint8_t h=1; h<=6; ++h) {
-      if (h == discoHouse) applyWinTok(h, kWinPatterns[0]);
+      if (!isT2[h]) {
+        applyPanelNumber(h, nums[h]);
+        continue;
+      }
+      // Find index in t2H list
+      uint8_t slot=0;
+      for (uint8_t i=0;i<3;i++) if (t2H[i]==h) { slot=i; break; }
+      uint8_t which = cat[slot];
+      if (which == 0) {
+        applyPanelText(h, eqs[slot%2]);
+      } else if (which == 1) {
+        applyPanelText(h, kPanelNamesT2[nameIdx[slot%2]]);
+      } else {
+        applyPanelText(h, kPanelIconsT2[iconIdx[slot%2]]);
+      }
+    }
+
+    // Windows: 1 W2 pattern, rest W1 solids
+    uint8_t discoHouse = (uint8_t)(1 + (rng() % 6));
+    const WinTok& p = kWinW2[rng() % (sizeof(kWinW2)/sizeof(kWinW2[0]))];
+    for (uint8_t h=1; h<=6; ++h) {
+      if (h == discoHouse) applyWinTok(h, p);
       else applyWinTok(h, kWinSolids[winIdx[h-1]]);
     }
 
@@ -591,41 +743,76 @@ void PizzaGameEngine::buildMappingForLevel(uint8_t lvl) {
   }
 
   if (lvl == 4) {
-    // Panel: T2 all equations
-    char eqs[6][12];
-    makeUniqueEquations(eqs, 6, m_io.rand32);
-    for (uint8_t h=1; h<=6; ++h) applyPanelT2(h, eqs[h-1]);
+    // Panel: T2 all (2 equations, 2 names, 2 icons)
+    char eqs[2][12];
+    makeUniqueEquations(eqs, 2, m_io.rand32);
 
-    // Windows: 3 disco, 3 rainbow
+    uint8_t namePool[2];
+    {
+      uint8_t N = (uint8_t)(sizeof(kPanelNamesT2)/sizeof(kPanelNamesT2[0]));
+      uint8_t tmp[32]; for (uint8_t i=0;i<N;i++) tmp[i]=i;
+      shuffleU8(tmp, N, m_io.rand32);
+      namePool[0]=tmp[0]; namePool[1]=tmp[1];
+    }
+
+    uint8_t iconPool[2];
+    {
+      uint8_t N = (uint8_t)(sizeof(kPanelIconsT2)/sizeof(kPanelIconsT2[0]));
+      uint8_t tmp[32]; for (uint8_t i=0;i<N;i++) tmp[i]=i;
+      shuffleU8(tmp, N, m_io.rand32);
+      iconPool[0]=tmp[0]; iconPool[1]=tmp[1];
+    }
+
+    // Assign in shuffled house order to keep it feeling random
+    uint8_t hh[6] = {1,2,3,4,5,6};
+    shuffleU8(hh, 6, m_io.rand32);
+    applyPanelText(hh[0], eqs[0]);
+    applyPanelText(hh[1], eqs[1]);
+    applyPanelText(hh[2], kPanelNamesT2[namePool[0]]);
+    applyPanelText(hh[3], kPanelNamesT2[namePool[1]]);
+    applyPanelText(hh[4], kPanelIconsT2[iconPool[0]]);
+    applyPanelText(hh[5], kPanelIconsT2[iconPool[1]]);
+
+    // Windows: W2 3/3 (two distinct patterns)
+    uint8_t wpN = (uint8_t)(sizeof(kWinW2)/sizeof(kWinW2[0]));
+    uint8_t wpi[16];
+    for (uint8_t i=0;i<wpN;i++) wpi[i]=i;
+    shuffleU8(wpi, wpN, m_io.rand32);
+    const WinTok& a = kWinW2[wpi[0]];
+    const WinTok& b = kWinW2[wpi[1]];
+
     uint8_t wh[6] = {1,2,3,4,5,6};
     shuffleU8(wh, 6, m_io.rand32);
-    for (uint8_t i=0;i<3;i++) applyWinTok(wh[i], kWinPatterns[0]);
-    for (uint8_t i=3;i<6;i++) applyWinTok(wh[i], kWinPatterns[1]);
+    for (uint8_t i=0;i<3;i++) applyWinTok(wh[i], a);
+    for (uint8_t i=3;i<6;i++) applyWinTok(wh[i], b);
 
     // Sound: S2 2/2 + S1 1/1
+    uint8_t spN = (uint8_t)(sizeof(kSoundS2)/sizeof(kSoundS2[0]));
+    uint8_t spi[16]; for (uint8_t i=0;i<spN;i++) spi[i]=i;
+    shuffleU8(spi, spN, m_io.rand32);
+
     uint8_t sh[6] = {1,2,3,4,5,6};
     shuffleU8(sh, 6, m_io.rand32);
-    applySoundTok(sh[0], kSoundS2[0], 70);
-    applySoundTok(sh[1], kSoundS2[0], 70);
-    applySoundTok(sh[2], kSoundS2[1], 70);
-    applySoundTok(sh[3], kSoundS2[1], 70);
+    applySoundTok(sh[0], kSoundS2[spi[0]], 70);
+    applySoundTok(sh[1], kSoundS2[spi[0]], 70);
+    applySoundTok(sh[2], kSoundS2[spi[1]], 70);
+    applySoundTok(sh[3], kSoundS2[spi[1]], 70);
     applySoundTok(sh[4], kSoundS1[sndIdx[0]], 70);
     applySoundTok(sh[5], kSoundS1[sndIdx[1]], 70);
 
-    // Bucket overlay: either brightness buckets on disco, OR volume buckets on 3 dogs
+    // Bucket overlay: either brightness buckets on one W2 pattern, OR volume buckets on dogs
     bool bucketVolume = ((rng() % 2) == 1);
     if (!bucketVolume) {
-      // dim/normal/bright disco buckets on the 3 disco houses
-      // Find the disco houses: those with token "disco"
-      uint8_t disco[3];
-      uint8_t dn=0;
-      for (uint8_t h=1; h<=6 && dn<3; ++h) {
-        if (strcmp(m_id[h].windowToken, "disco") == 0) disco[dn++] = h;
+      // Brightness buckets on the FIRST W2 pattern group (a)
+      // Find 3 houses whose window token == a.token
+      uint8_t grp[3]; uint8_t gn=0;
+      for (uint8_t h=1; h<=6 && gn<3; ++h) {
+        if (strcmp(m_id[h].windowToken, a.token) == 0) grp[gn++] = h;
       }
-      if (dn==3) {
-        m_id[disco[0]].winV = 60;  strlcpy(m_id[disco[0]].windowToken, "dim disco", sizeof(m_id[disco[0]].windowToken));
-        m_id[disco[1]].winV = 120; strlcpy(m_id[disco[1]].windowToken, "disco", sizeof(m_id[disco[1]].windowToken));
-        m_id[disco[2]].winV = 200; strlcpy(m_id[disco[2]].windowToken, "bright disco", sizeof(m_id[disco[2]].windowToken));
+      if (gn==3) {
+        m_id[grp[0]].winV = 60;  snprintf(m_id[grp[0]].windowToken, sizeof(m_id[grp[0]].windowToken), "dim %s", a.token);
+        m_id[grp[1]].winV = 120; strlcpy(m_id[grp[1]].windowToken, a.token, sizeof(m_id[grp[1]].windowToken));
+        m_id[grp[2]].winV = 200; snprintf(m_id[grp[2]].windowToken, sizeof(m_id[grp[2]].windowToken), "bright %s", a.token);
       }
     } else {
       // Volume buckets: force 3 houses to be dog at quiet/med/loud
@@ -643,29 +830,66 @@ void PizzaGameEngine::buildMappingForLevel(uint8_t lvl) {
 
   // lvl 5
   {
-    char eqs[6][12];
-    makeUniqueEquations(eqs, 6, m_io.rand32);
-    for (uint8_t h=1; h<=6; ++h) applyPanelT2(h, eqs[h-1]);
+    // Panel: T2 all (2/2/2 again)
+    char eqs[2][12];
+    makeUniqueEquations(eqs, 2, m_io.rand32);
 
-    // Windows: W3 2/2/2 (chase cw, chase ccw, disco)
+    uint8_t namePool[2];
+    {
+      uint8_t N = (uint8_t)(sizeof(kPanelNamesT2)/sizeof(kPanelNamesT2[0]));
+      uint8_t tmp[32]; for (uint8_t i=0;i<N;i++) tmp[i]=i;
+      shuffleU8(tmp, N, m_io.rand32);
+      namePool[0]=tmp[0]; namePool[1]=tmp[1];
+    }
+
+    uint8_t iconPool[2];
+    {
+      uint8_t N = (uint8_t)(sizeof(kPanelIconsT2)/sizeof(kPanelIconsT2[0]));
+      uint8_t tmp[32]; for (uint8_t i=0;i<N;i++) tmp[i]=i;
+      shuffleU8(tmp, N, m_io.rand32);
+      iconPool[0]=tmp[0]; iconPool[1]=tmp[1];
+    }
+
+    uint8_t hh[6] = {1,2,3,4,5,6};
+    shuffleU8(hh, 6, m_io.rand32);
+    applyPanelText(hh[0], eqs[0]);
+    applyPanelText(hh[1], eqs[1]);
+    applyPanelText(hh[2], kPanelNamesT2[namePool[0]]);
+    applyPanelText(hh[3], kPanelNamesT2[namePool[1]]);
+    applyPanelText(hh[4], kPanelIconsT2[iconPool[0]]);
+    applyPanelText(hh[5], kPanelIconsT2[iconPool[1]]);
+
+    // Windows: 2/2/2 using two W3 motion patterns + one W2 pattern
+    uint8_t w3N = (uint8_t)(sizeof(kWinW3)/sizeof(kWinW3[0]));
+    uint8_t w3i[16]; for (uint8_t i=0;i<w3N;i++) w3i[i]=i;
+    shuffleU8(w3i, w3N, m_io.rand32);
+    const WinTok& m1 = kWinW3[w3i[0]];
+    const WinTok& m2 = kWinW3[w3i[1]];
+
+    const WinTok& p  = kWinW2[rng() % (sizeof(kWinW2)/sizeof(kWinW2[0]))];
+
     uint8_t wh[6] = {1,2,3,4,5,6};
     shuffleU8(wh, 6, m_io.rand32);
-    applyWinTok(wh[0], kWinPatterns[2]);
-    applyWinTok(wh[1], kWinPatterns[2]);
-    applyWinTok(wh[2], kWinPatterns[3]);
-    applyWinTok(wh[3], kWinPatterns[3]);
-    applyWinTok(wh[4], kWinPatterns[0]);
-    applyWinTok(wh[5], kWinPatterns[0]);
+    applyWinTok(wh[0], m1);
+    applyWinTok(wh[1], m1);
+    applyWinTok(wh[2], m2);
+    applyWinTok(wh[3], m2);
+    applyWinTok(wh[4], p);
+    applyWinTok(wh[5], p);
 
     // Sound: S2 2/2/2
+    uint8_t spN = (uint8_t)(sizeof(kSoundS2)/sizeof(kSoundS2[0]));
+    uint8_t spi[16]; for (uint8_t i=0;i<spN;i++) spi[i]=i;
+    shuffleU8(spi, spN, m_io.rand32);
+
     uint8_t sh[6] = {1,2,3,4,5,6};
     shuffleU8(sh, 6, m_io.rand32);
-    applySoundTok(sh[0], kSoundS2[0], 70);
-    applySoundTok(sh[1], kSoundS2[0], 70);
-    applySoundTok(sh[2], kSoundS2[1], 70);
-    applySoundTok(sh[3], kSoundS2[1], 70);
-    applySoundTok(sh[4], kSoundS2[2], 70);
-    applySoundTok(sh[5], kSoundS2[2], 70);
+    applySoundTok(sh[0], kSoundS2[spi[0]], 70);
+    applySoundTok(sh[1], kSoundS2[spi[0]], 70);
+    applySoundTok(sh[2], kSoundS2[spi[1]], 70);
+    applySoundTok(sh[3], kSoundS2[spi[1]], 70);
+    applySoundTok(sh[4], kSoundS2[spi[2]], 70);
+    applySoundTok(sh[5], kSoundS2[spi[2]], 70);
   }
 }
 
@@ -951,14 +1175,25 @@ bool PizzaGameEngine::buildUniqueSingle(Domain d, uint8_t& outHouse, char* outTe
 
   // Render G1 clue
   if (d == Domain::Panel) {
-    if (isDigitsOnly(sel.tok)) snprintf(outText, outTextSz, "house #%s", sel.tok);
-    else snprintf(outText, outTextSz, "the house labeled %s", sel.tok);
+    if (sel.tok[0] == '@') {
+      char name[24]={0};
+      strlcpy(name, sel.tok+1, sizeof(name));
+      // Uppercase in clue for emphasis
+      for (char* p=name; *p; ++p) { if (*p>='a' && *p<='z') *p = (char)(*p - 'a' + 'A'); }
+      snprintf(outText, outTextSz, "the house with the %s icon", name);
+    }
+    else if (isDigitsOnly(sel.tok)) {
+      snprintf(outText, outTextSz, "house #%s", sel.tok);
+    }
+    else {
+      snprintf(outText, outTextSz, "the house labeled %s", sel.tok);
+    }
   }
   else if (d == Domain::Window) {
-    snprintf(outText, outTextSz, "the %s windows house", sel.tok);
+    snprintf(outText, outTextSz, "the house with %s windows", sel.tok);
   }
   else if (d == Domain::Sound) {
-    snprintf(outText, outTextSz, "the %s house", sel.tok);
+    snprintf(outText, outTextSz, "the house with %s sound", sel.tok);
   }
   else {
     // Physical token is "door/handle"
@@ -1080,6 +1315,36 @@ bool PizzaGameEngine::buildUniqueCompositeAnchored(Domain anchor, uint8_t& outHo
 
   auto prettyTok=[&](Domain d, const char* tok, char* out, size_t outSz){
     if (!tok || !*tok) { strlcpy(out, "", outSz); return; }
+    if (d == Domain::Panel) {
+      // Panel token is either digits, text, or icon token like "@STAR"
+      if (tok[0] == '@') {
+        char name[24]={0};
+        strlcpy(name, tok+1, sizeof(name));
+        // Uppercase for readability
+        for (char* p=name; *p; ++p) { if (*p>='a' && *p<='z') *p = (char)(*p - 'a' + 'A'); }
+        snprintf(out, outSz, "the %s icon", name);
+        return;
+      }
+      if (isDigitsOnly(tok)) {
+        snprintf(out, outSz, "#%s", tok);
+        return;
+      }
+      // normal text
+      strlcpy(out, tok, outSz);
+      return;
+    }
+
+    if (d == Domain::Window) {
+      // Make composites read naturally: "windows are disco" etc.
+      strlcpy(out, tok, outSz);
+      return;
+    }
+
+    if (d == Domain::Sound) {
+      strlcpy(out, tok, outSz);
+      return;
+    }
+
     if (d != Domain::Physical) { strlcpy(out, tok, outSz); return; }
 
     const char* slash = strchr(tok, '/');
@@ -1160,15 +1425,33 @@ void PizzaGameEngine::initStaticFacts() {
     m_phys[h].handleColor= handleColor[h];
   }
 
-  // Relations: ring for left/right; opposite is +3 in ring
-  for (uint8_t h=1; h<=6; ++h) {
-    uint8_t left  = (h==1)?6:(h-1);
-    uint8_t right = (h==6)?1:(h+1);
-    uint8_t opp   = (uint8_t)(((h + 2) % 6) + 1);
-    m_leftOf[h]  = left;
-    m_rightOf[h] = right;
-    m_opposite[h]= opp;
+  // Relations: match the physical room mapping
+  // - Right side: 1,2,3 (in that order)
+  // - Left side:  6,5,4 (in that order)
+  // - Across: 3<->4, 2<->5, 1<->6
+  //
+  // We treat leftOf/rightOf as "immediately adjacent on the SAME side".
+  // End houses have 0 for the missing neighbor.
+  for (uint8_t h=0; h<=6; ++h) {
+    m_leftOf[h] = 0;
+    m_rightOf[h] = 0;
+    m_opposite[h] = 0;
   }
+
+  // Right side adjacency
+  m_rightOf[1] = 2;
+  m_leftOf[2]  = 1;  m_rightOf[2] = 3;
+  m_leftOf[3]  = 2;
+
+  // Left side adjacency
+  m_rightOf[6] = 5;
+  m_leftOf[5]  = 6;  m_rightOf[5] = 4;
+  m_leftOf[4]  = 5;
+
+  // Across
+  m_opposite[1] = 6; m_opposite[6] = 1;
+  m_opposite[2] = 5; m_opposite[5] = 2;
+  m_opposite[3] = 4; m_opposite[4] = 3;
 }
 
 // -----------------------------

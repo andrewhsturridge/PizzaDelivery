@@ -129,6 +129,9 @@ public:
 
   // Start/stop a run
   void startGame(uint32_t nowMs);
+  // Start a run at a specific level (1..5). Useful for dev/testing via CLI.
+  // NOTE: also rebuilds the mapping for that level and seeds its first wave.
+  void startGameAtLevel(uint8_t startLvl, uint32_t nowMs);
   void stopGame(uint32_t nowMs);
 
   // Tick timers + expiry + refill logic

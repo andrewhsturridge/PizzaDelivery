@@ -107,18 +107,137 @@ static bool writeBeepWav(const char* path, float freq_hz, uint16_t ms, uint8_t a
   return true;
 }
 
+
+// Multi-beep pattern WAV writer (16-bit mono, 22.05kHz)
+// pattern = list of (tone_ms, gap_ms) pairs; last gap_ms is appended too.
+static bool writeBeepPatternWav(const char* path, float freq_hz,
+                               const uint16_t* toneMs, const uint16_t* gapMs, uint8_t n,
+                               uint8_t amplitude /*0..255*/) {
+  const uint32_t sr = 22050;
+  if (n == 0) return false;
+
+  // Precompute total samples
+  uint32_t totalTone = 0, totalGap = 0;
+  for (uint8_t i=0;i<n;i++){ totalTone += toneMs[i]; totalGap += gapMs[i]; }
+  uint32_t totalMs = totalTone + totalGap;
+  if (totalMs < 10) totalMs = 10;
+
+  uint32_t totalSamples = (sr * totalMs) / 1000;
+  if (totalSamples < 10) totalSamples = 10;
+
+  // Small fade per tone segment to kill clicks
+  const uint32_t fadeMs = 4;
+  const uint32_t fadeSamples = (sr * fadeMs) / 1000;
+
+  // 3 ms silence tail
+  const uint32_t tailSilence = (sr * 3) / 1000;
+
+  const float amp = (amplitude / 255.0f) * 28000.0f;
+
+  File f = LittleFS.open(path, FILE_WRITE);
+  if (!f) return false;
+
+  const uint32_t dataBytes = (totalSamples + tailSilence) * 2;
+  const uint32_t riffSize  = 36 + dataBytes;
+  auto w16=[&](uint16_t v){ f.write((uint8_t*)&v,2); };
+  auto w32=[&](uint32_t v){ f.write((uint8_t*)&v,4); };
+  f.write((const uint8_t*)"RIFF",4); w32(riffSize);
+  f.write((const uint8_t*)"WAVE",4);
+  f.write((const uint8_t*)"fmt ",4); w32(16); w16(1); w16(1); w32(sr); w32(sr*2); w16(2); w16(16);
+  f.write((const uint8_t*)"data",4); w32(dataBytes);
+
+  const float omega = 2.0f * 3.14159265f * freq_hz / sr;
+
+  uint32_t sampleIndex = 0;
+  for (uint8_t seg=0; seg<n; ++seg) {
+    // tone
+    uint32_t toneSamples = (sr * toneMs[seg]) / 1000;
+    if (toneSamples < 1) toneSamples = 1;
+    uint32_t fade = fadeSamples;
+    if (fade*2 >= toneSamples) fade = toneSamples/4;
+
+    for (uint32_t i=0; i<toneSamples; ++i) {
+      float env = 1.0f;
+      if (i < fade) env = (float)i / (float)fade;
+      else if (i > toneSamples - fade) env = (float)(toneSamples - i) / (float)fade;
+      float s = sinf(omega * (sampleIndex + i)) * env;
+      int16_t v = (int16_t)(amp * s);
+      f.write((uint8_t*)&v, 2);
+    }
+    sampleIndex += toneSamples;
+
+    // gap
+    uint32_t gapSamples = (sr * gapMs[seg]) / 1000;
+    int16_t z = 0;
+    for (uint32_t i=0; i<gapSamples; ++i) f.write((uint8_t*)&z, 2);
+    sampleIndex += gapSamples;
+  }
+
+  // tail
+  int16_t z=0;
+  for (uint32_t i=0;i<tailSilence;i++) f.write((uint8_t*)&z,2);
+
+  f.close();
+  return true;
+}
+
 // Call this once in setup() after LittleFS.begin()
 static void ensureBeepWavs() {
   if (!LittleFS.begin()) LittleFS.begin(true);
   LittleFS.mkdir("/clips");
-  if (!LittleFS.exists("/clips/090.wav")) writeBeepWav("/clips/090.wav", 1000.0f, 200, 180); // OK beep
-  if (!LittleFS.exists("/clips/091.wav")) writeBeepWav("/clips/091.wav",  400.0f, 200, 180); // ERR beep
+
+  // Delivery result beeps
+  if (!LittleFS.exists("/clips/090.wav")) writeBeepWav("/clips/090.wav", 1000.0f, 200, 180); // OK
+  if (!LittleFS.exists("/clips/091.wav")) writeBeepWav("/clips/091.wav",  400.0f, 200, 180); // ERR
+
+  // Tier S2 generated beep-pattern identities (100..105)
+  // Keep these VERY distinct.
+  {
+    // 100: double beep
+    const uint16_t tone[] = {120,120};
+    const uint16_t gap[]  = {80,  0};
+    if (!LittleFS.exists("/clips/100.wav")) writeBeepPatternWav("/clips/100.wav", 950.0f, tone, gap, 2, 180);
+  }
+  {
+    // 101: triple beep
+    const uint16_t tone[] = {90,90,90};
+    const uint16_t gap[]  = {70,70,0};
+    if (!LittleFS.exists("/clips/101.wav")) writeBeepPatternWav("/clips/101.wav", 950.0f, tone, gap, 3, 180);
+  }
+  {
+    // 102: long beep
+    const uint16_t tone[] = {320};
+    const uint16_t gap[]  = {0};
+    if (!LittleFS.exists("/clips/102.wav")) writeBeepPatternWav("/clips/102.wav", 950.0f, tone, gap, 1, 180);
+  }
+  {
+    // 103: short-long
+    const uint16_t tone[] = {80, 220};
+    const uint16_t gap[]  = {80, 0};
+    if (!LittleFS.exists("/clips/103.wav")) writeBeepPatternWav("/clips/103.wav", 950.0f, tone, gap, 2, 180);
+  }
+  {
+    // 104: long-short
+    const uint16_t tone[] = {220, 80};
+    const uint16_t gap[]  = {80, 0};
+    if (!LittleFS.exists("/clips/104.wav")) writeBeepPatternWav("/clips/104.wav", 950.0f, tone, gap, 2, 180);
+  }
+  {
+    // 105: five fast beeps
+    const uint16_t tone[] = {50,50,50,50,50};
+    const uint16_t gap[]  = {45,45,45,45,0};
+    if (!LittleFS.exists("/clips/105.wav")) writeBeepPatternWav("/clips/105.wav", 950.0f, tone, gap, 5, 180);
+  }
 }
 
 // LED effect state (driven from loop)
 enum Effect { EFFECT_NONE, EFFECT_OK_PULSE, EFFECT_ERR_PULSE, EFFECT_YELLOW_PING };
 static Effect   g_fx      = EFFECT_NONE;
 static uint32_t g_fxUntil = 0;   // millis() deadline for one-shot effects
+
+// After a one-shot pulse (success/fail/ping), restore the house's identity window.
+// This fixes the issue where the pulse would leave the window "stuck" off.
+static void restoreWindowIdentity();
 
 /*** Delivery FSM (scan -> await result -> require removal) ***/
 enum HState : uint8_t { HS_IDLE=0, HS_WAIT_RESULT, HS_WAIT_REMOVAL };
@@ -139,7 +258,14 @@ static uint32_t g_absentSince  = 0;
 // window fx  state
 static uint8_t  g_winFx   = WIN_FX_OFF;
 static uint8_t  g_winH=0, g_winS=0, g_winV=0, g_winSpd=0;
-static uint32_t g_nextFxAt = 0;     // scheduling for rainbow/party
+static uint32_t g_nextFxAt = 0;     // scheduling for animated window FX
+
+// window animation scratch state (reset when FX changes)
+static int32_t  g_animPos   = 0;
+static int32_t  g_animDir   = 1;
+static bool     g_animFlip  = false;
+static float    g_animPhase = 0.0f;
+static uint8_t  g_animHue   = 0;
 
 static TaskHandle_t g_audioTask = nullptr;
 
@@ -202,8 +328,18 @@ static uint32_t hsv2rgb(uint8_t h, uint8_t s, uint8_t v){
 }
 
 // Apply window effect immediately (solid) or schedule (animated)
+// Apply window effect immediately (solid/off) or schedule (animated)
 static void applyWindow(uint8_t fx, uint8_t h, uint8_t s, uint8_t v, uint8_t spd){
   g_winFx = fx; g_winH=h; g_winS=s; g_winV=v; g_winSpd=spd;
+
+  // Reset animation scratch each time identity changes
+  g_nextFxAt  = 0;
+  g_animPos   = 0;
+  g_animDir   = 1;
+  g_animFlip  = false;
+  g_animPhase = 0.0f;
+  g_animHue   = 0;
+
   if (fx == WIN_FX_OFF){
     strip.clear(); strip.show();
   } else if (fx == WIN_FX_SOLID){
@@ -212,8 +348,12 @@ static void applyWindow(uint8_t fx, uint8_t h, uint8_t s, uint8_t v, uint8_t spd
     strip.show();
   } else {
     // animated modes tick in loop()
-    g_nextFxAt = 0;
   }
+}
+
+static void restoreWindowIdentity() {
+  // Re-apply whatever identity Central last set (solid or animated).
+  applyWindow(g_winFx, g_winH, g_winS, g_winV, g_winSpd);
 }
 
 // Asset Sync: to pivot radio for HTTP (Pizza_HouseNode.ino)
@@ -700,53 +840,225 @@ void loop() {
       if (now <= g_fxUntil) {
         for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, strip.Color(0,64,0));
         strip.show();
-      } else { strip.clear(); strip.show(); g_fx = EFFECT_NONE; }
+      } else {
+        g_fx = EFFECT_NONE;
+        restoreWindowIdentity();
+      }
       break;
 
     case EFFECT_ERR_PULSE:
       if (now <= g_fxUntil) {
         for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, strip.Color(64,0,0));
         strip.show();
-      } else { strip.clear(); strip.show(); g_fx = EFFECT_NONE; }
+      } else {
+        g_fx = EFFECT_NONE;
+        restoreWindowIdentity();
+      }
       break;
 
     case EFFECT_YELLOW_PING:
       if (now <= g_fxUntil) {
         for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, strip.Color(80,80,0));
         strip.show();
-      } else { strip.clear(); strip.show(); g_fx = EFFECT_NONE; }
+      } else {
+        g_fx = EFFECT_NONE;
+        restoreWindowIdentity();
+      }
       break;
 
     case EFFECT_NONE:
     default:
-      // stay off
+      // no one-shot overlay
       break;
   }
 
-  if (g_winFx == WIN_FX_RAINBOW) {
+  // Only drive window animations when we're not in the middle of a result/ping pulse.
+  if (g_fx == EFFECT_NONE) {
+    auto fxInterval = [&](uint8_t spd, uint16_t fastMs, uint16_t slowMs) -> uint16_t {
+      // spd 0..255, 255 fastest
+      if (fastMs >= slowMs) return fastMs;
+      uint32_t span = (uint32_t)(slowMs - fastMs);
+      uint32_t v = slowMs - (uint32_t)spd * span / 255U;
+      return (uint16_t)v;
+    };
+
     if ((int32_t)(now - g_nextFxAt) >= 0) {
-      static uint8_t hue = 0; hue += (g_winSpd? g_winSpd : 4);
-      for (uint16_t i=0;i<LED_COUNT;i++){
-        uint8_t h = hue + (i*3);
-        strip.setPixelColor(i, hsv2rgb(h, g_winS?g_winS:255, g_winV?g_winV:120));
+      switch (g_winFx) {
+        case WIN_FX_RAINBOW: {
+          // legacy rainbow fill
+          g_animHue += (g_winSpd ? g_winSpd : 4);
+          for (uint16_t i=0;i<LED_COUNT;i++) {
+            uint8_t h = (uint8_t)(g_animHue + (i*3));
+            strip.setPixelColor(i, hsv2rgb(h, g_winS?g_winS:255, g_winV?g_winV:120));
+          }
+          strip.show();
+          g_nextFxAt = now + fxInterval(g_winSpd, 18, 55);
+        } break;
+
+        case WIN_FX_PARTY: {
+          // disco: chaotic per-pixel pops
+          for (uint16_t i=0;i<LED_COUNT;i++) {
+            uint8_t h = (uint8_t)esp_random();
+            strip.setPixelColor(i, hsv2rgb(h, 200, g_winV?g_winV:120));
+          }
+          strip.show();
+          g_nextFxAt = now + fxInterval(g_winSpd, 25, 120);
+        } break;
+
+        case WIN_FX_POLICE: {
+          g_animFlip = !g_animFlip;
+          uint8_t v = g_winV ? g_winV : 140;
+          uint32_t c = g_animFlip ? strip.Color(v,0,0) : strip.Color(0,0,v);
+          for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, c);
+          strip.show();
+          g_nextFxAt = now + fxInterval(g_winSpd, 70, 220);
+        } break;
+
+        case WIN_FX_FLICKER: {
+          // warm flicker (orange/yellow)
+          uint8_t baseV = g_winV ? g_winV : 140;
+          for (uint16_t i=0;i<LED_COUNT;i++) {
+            int dh = (int)(esp_random()%17) - 8; // -8..+8
+            int dv = (int)(esp_random()%81) - 40; // -40..+40
+            uint8_t h = (uint8_t)(18 + dh);
+            int v = (int)baseV + dv;
+            if (v < 25) v = 25; if (v > 220) v = 220;
+            strip.setPixelColor(i, hsv2rgb(h, 255, (uint8_t)v));
+          }
+          strip.show();
+          g_nextFxAt = now + fxInterval(g_winSpd, 22, 80);
+        } break;
+
+        case WIN_FX_SPARKLE: {
+          strip.clear();
+          uint8_t n = 1 + (g_winSpd / 50); // 1..6
+          if (n > 8) n = 8;
+          for (uint8_t k=0;k<n;k++) {
+            uint16_t idx = (uint16_t)(esp_random() % LED_COUNT);
+            strip.setPixelColor(idx, strip.Color(180,180,180));
+          }
+          strip.show();
+          g_nextFxAt = now + fxInterval(g_winSpd, 40, 140);
+        } break;
+
+        case WIN_FX_PULSE: {
+          // smooth breathing brightness on a single hue
+          g_animPhase += 0.08f + (g_winSpd / 255.0f) * 0.22f; // ~0.08..0.30
+          if (g_animPhase > 6.28318f) g_animPhase -= 6.28318f;
+          float a = (sinf(g_animPhase) + 1.0f) * 0.5f; // 0..1
+          uint8_t maxV = g_winV ? g_winV : 160;
+          uint8_t minV = 20;
+          uint8_t v = (uint8_t)(minV + a * (float)(maxV - minV));
+          uint32_t c = hsv2rgb(g_winH, g_winS?g_winS:255, v);
+          for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, c);
+          strip.show();
+          g_nextFxAt = now + 30;
+        } break;
+
+        case WIN_FX_STROBE: {
+          g_animFlip = !g_animFlip;
+          if (g_animFlip) {
+            uint8_t v = g_winV ? g_winV : 180;
+            uint32_t c = strip.Color(v,v,v);
+            for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, c);
+          } else {
+            strip.clear();
+          }
+          strip.show();
+          g_nextFxAt = now + fxInterval(g_winSpd, 45, 220);
+        } break;
+
+        case WIN_FX_SPLIT_SWAP: {
+          g_animFlip = !g_animFlip;
+          uint8_t hA = g_winH;
+          uint8_t hB = (uint8_t)(g_winH + 128);
+          uint8_t v  = g_winV ? g_winV : 150;
+          uint32_t cA = hsv2rgb(hA, g_winS?g_winS:255, v);
+          uint32_t cB = hsv2rgb(hB, g_winS?g_winS:255, v);
+          uint16_t half = LED_COUNT / 2;
+          for (uint16_t i=0;i<LED_COUNT;i++) {
+            bool first = (i < half);
+            uint32_t c = (g_animFlip ? (first?cB:cA) : (first?cA:cB));
+            strip.setPixelColor(i, c);
+          }
+          strip.show();
+          g_nextFxAt = now + fxInterval(g_winSpd, 120, 420);
+        } break;
+
+        case WIN_FX_CHASE_CW:
+        case WIN_FX_CHASE_CCW:
+        case WIN_FX_BOUNCE: {
+          // single dot + tiny tail on dark
+          strip.clear();
+          uint8_t v = g_winV ? g_winV : 170;
+          uint32_t head = hsv2rgb(g_winH, g_winS?g_winS:255, v);
+          uint32_t tail = hsv2rgb(g_winH, g_winS?g_winS:255, (uint8_t)(v/3));
+
+          int32_t pos = g_animPos;
+          if (pos < 0) pos = 0;
+          if (pos >= (int32_t)LED_COUNT) pos = LED_COUNT-1;
+
+          strip.setPixelColor((uint16_t)pos, head);
+          // tail neighbors
+          if (pos > 0) strip.setPixelColor((uint16_t)(pos-1), tail);
+          if (pos + 1 < (int32_t)LED_COUNT) strip.setPixelColor((uint16_t)(pos+1), tail);
+          strip.show();
+
+          // advance
+          int step = 1 + (g_winSpd / 128); // 1..2
+          if (g_winFx == WIN_FX_CHASE_CW) {
+            g_animPos = (g_animPos + step) % (int32_t)LED_COUNT;
+          } else if (g_winFx == WIN_FX_CHASE_CCW) {
+            g_animPos = (g_animPos - step);
+            while (g_animPos < 0) g_animPos += (int32_t)LED_COUNT;
+          } else {
+            // bounce
+            g_animPos += g_animDir;
+            if (g_animPos <= 0) { g_animPos = 0; g_animDir = 1; }
+            else if (g_animPos >= (int32_t)LED_COUNT-1) { g_animPos = (int32_t)LED_COUNT-1; g_animDir = -1; }
+          }
+
+          g_nextFxAt = now + fxInterval(g_winSpd, 18, 90);
+        } break;
+
+        case WIN_FX_WEDGE_CW:
+        case WIN_FX_WEDGE_CCW: {
+          strip.clear();
+          uint8_t v = g_winV ? g_winV : 170;
+          uint32_t c = hsv2rgb(g_winH, g_winS?g_winS:255, v);
+          uint16_t wedge = (LED_COUNT / 10);
+          if (wedge < 6) wedge = 6;
+
+          for (uint16_t j=0; j<wedge; ++j) {
+            int32_t idx = (int32_t)g_animPos + (int32_t)j;
+            while (idx < 0) idx += (int32_t)LED_COUNT;
+            idx %= (int32_t)LED_COUNT;
+            strip.setPixelColor((uint16_t)idx, c);
+          }
+          strip.show();
+
+          int step = 1 + (g_winSpd / 160); // 1..2
+          if (g_winFx == WIN_FX_WEDGE_CW) {
+            g_animPos = (g_animPos + step) % (int32_t)LED_COUNT;
+          } else {
+            g_animPos = (g_animPos - step);
+            while (g_animPos < 0) g_animPos += (int32_t)LED_COUNT;
+          }
+
+          g_nextFxAt = now + fxInterval(g_winSpd, 18, 90);
+        } break;
+
+        case WIN_FX_SOLID:
+        case WIN_FX_OFF:
+        default:
+          // no animation needed
+          break;
       }
-      strip.show(); PizzaAudioFS::loop();
-      g_nextFxAt = now + 30;
-    }
-  } else if (g_winFx == WIN_FX_PARTY) {
-    if ((int32_t)(now - g_nextFxAt) >= 0) {
-      for (uint16_t i=0;i<LED_COUNT;i++){
-        uint8_t h = (uint8_t)esp_random();
-        strip.setPixelColor(i, hsv2rgb(h, 200, g_winV?g_winV:120));
-      }
-      strip.show(); PizzaAudioFS::loop();
-      uint16_t pace = 40 + (255 - g_winSpd); // faster with higher speed
-      g_nextFxAt = now + pace;
     }
   }
 
 
-  // --- Speaker identity beacon tick (quiet periodic) ---
+  // --- Speaker identity beacon tick (quiet periodic) --- (quiet periodic) ---
   if (g_beaconEnabled && g_beaconClip != 0) {
     if ((int32_t)(now - g_beaconNextAt) >= 0) {
       // Don't interrupt result beeps or any currently playing clip
@@ -764,6 +1076,9 @@ void loop() {
       }
     }
   }
+
+  // Keep audio streaming healthy regardless of which LED mode we are in.
+  PizzaAudioFS::loop();
 
   delay(1); // cooperative yield
 }

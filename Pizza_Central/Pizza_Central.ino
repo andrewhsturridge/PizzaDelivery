@@ -27,8 +27,10 @@ static char g_net_pass[64] = WIFI_DEFAULT_PASS;
 static char g_net_base[128]= OTA_BASE_URL_DEFAULT;
 
 /*** Block A: GLOBAL STATE + HELPERS ***/
-static const uint8_t MASK_NONE = 0xFF;      // "no order set"
-static uint8_t g_orderMask[256];            // house_id -> target mask
+// Legacy per-house validator masks (kept for backward compatibility / debugging).
+// NOTE: The new engine does NOT use this; deliveries are rejected when game is idle.
+static const uint8_t MASK_NONE = 0xFF;
+static uint8_t g_orderMask[256];
 
 // Small ring buffer of recent pizza tags we’ve seen (uid -> mask)
 struct TagEntry { uint8_t len; uint8_t uid[10]; uint8_t mask; uint32_t ts; };
@@ -147,11 +149,6 @@ static void ordersPushWindow(uint8_t maxDisplay = 3);
 static void ordersPushWindowDripStart(uint8_t maxDisplay, uint16_t startDelayMs = 0);
 
 // Helpers
-static void gameResetOrdersAndMasks(){
-  ordersResetLocal();
-  for (int i=0;i<256;i++) g_orderMask[i] = MASK_NONE;
-}
-
 // Print status (now includes lives)
 // Print status (engine-backed)
 static void gamePrintStatus(){
@@ -175,21 +172,14 @@ static void gamePrintStatus(){
   );
 }
 
-// Lose one life (end game if hits 0)
-static void gameLoseLife(uint8_t reason){
-  if (g_game.phase != GP_RUNNING) return;
-  if (g_game.livesLeft > 0) g_game.livesLeft--;
-  Serial.printf("game: LIFE LOST (reason=%u) -> %u/%u\n", reason, g_game.livesLeft, g_game.livesMax);
-  if (g_game.livesLeft == 0) {
-    Serial.println("game: OUT OF LIVES");
-    gameStop();
-  } else {
-    gamePrintStatus();
-  }
-}
+struct GameOverFx {
+  bool     active;
+  uint8_t  step;    // 0..N
+  uint32_t nextAt;
+} s_goFx = {false, 0, 0};
 
-static void gameStart(uint16_t minutes, uint8_t /*level*/){
-  // Level is owned by PizzaGameEngine; we always start at level 1 for real runs.
+static void gameStart(uint16_t minutes, uint8_t level){
+  // Level is owned by PizzaGameEngine; CLI can start at different levels for testing.
   // Minutes is the global run cap (players only reach full duration when mastered).
   if (minutes == 0) minutes = (uint16_t)(g_game.durationMs / 60000UL);
   if (minutes == 0) minutes = 6;
@@ -204,15 +194,20 @@ static void gameStart(uint16_t minutes, uint8_t /*level*/){
   // Reset ingredient cache so old pizzas don't carry into a new run
   ingredientsResetAll();
 
-  // Clear any legacy validators / lists
-  gameResetOrdersAndMasks();
+  // Clear any previous order window on the stations/panels
+  ordersResetLocal();
 
   // Lives for this run (per-game lives)
   if (g_game.livesMax == 0) g_game.livesMax = 5;
   g_engine.setLivesMax(g_game.livesMax);
 
+  // Stop any pending "game over" animation from a previous run
+  s_goFx.active = false;
+
   // Start engine (build house identities + spawn initial orders)
-  g_engine.startGame(now);
+  if (level < 1) level = 1;
+  if (level > 5) level = 5;
+  g_engine.startGameAtLevel((uint8_t)level, now);
 
   // Broadcast first order window (OrdersStation will start countdown from remain_s)
   ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
@@ -223,15 +218,55 @@ static void gameStart(uint16_t minutes, uint8_t /*level*/){
   gamePrintStatus();
 }
 
-static void housesStopBeacons(){
-  // Stop window + speaker identities (leave panels as-is unless you want to blank them)
+static void housesAllOff(){
+  // Turn off ALL house outputs when no game is running.
+  // (We still allow per-delivery success/fail pulses handled locally by HouseNode.)
   for (uint8_t h=1; h<=6; ++h){
     sendHouseDigital(h,
-      /*flags*/0x01 | 0x04,
+      /*flags*/0x01 | 0x02 | 0x04,           // window + panel + speaker
       /*win*/WIN_FX_OFF, 0,0,0,0,
-      /*panel*/PANEL_MODE_TEXT, "", 1,1,0,
+      /*panel*/PANEL_MODE_TEXT, "", 1,1,0, // blank + brightness 0
       /*spk*/0, 0, false, /*stopNow*/true
     );
+  }
+}
+
+// Simple non-blocking game-over animation: all windows blink red a few times,
+// then everything turns off and we return to IDLE.
+
+static void gameOverFxStart() {
+  s_goFx.active = true;
+  s_goFx.step   = 0;
+  s_goFx.nextAt = millis();
+}
+
+static void gameOverFxTick() {
+  if (!s_goFx.active) return;
+  const uint32_t now = millis();
+  if ((int32_t)(now - s_goFx.nextAt) < 0) return;
+
+  // 6 steps = 3 flashes (red/off)
+  const bool on = ((s_goFx.step % 2) == 0);
+  for (uint8_t h = 1; h <= 6; ++h) {
+    sendHouseDigital(h,
+      /*flags*/0x01 | 0x02 | 0x04,
+      /*win*/on ? WIN_FX_SOLID : WIN_FX_OFF,
+      /*h*/0, /*s*/255, /*v*/120, /*spd*/0,
+      /*panel*/PANEL_MODE_TEXT, "", 1, 1, 0,
+      /*spk*/0, 0, false, /*stopNow*/true
+    );
+  }
+
+  s_goFx.step++;
+  if (s_goFx.step >= 6) {
+    // Finalize: full off and back to idle
+    housesAllOff();
+    s_goFx.active = false;
+    g_game.phase = GP_IDLE;
+    Serial.println("game: OVER -> IDLE");
+    gamePrintStatus();
+  } else {
+    s_goFx.nextAt = now + 160;
   }
 }
 
@@ -248,8 +283,8 @@ static void gameStop(){
   // Clear list on OrdersStation
   ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
 
-  // Stop identity beacons (window/sound)
-  housesStopBeacons();
+  // Start game over window animation (panels stay off)
+  gameOverFxStart();
 
   // Also clear remembered toppings at game end
   ingredientsResetAll();
@@ -844,7 +879,7 @@ static void ordersPushWindow(uint8_t maxDisplay) {
 static void ordersSendShowText(const char* s) {
   PzOrderShowTextPayload p{};
   if (s && *s) strlcpy(p.text, s, sizeof(p.text));
-  else         strcpy(p.text, "NO ORDERS");
+  else         strcpy(p.text, "IDLE");
 
   uint8_t buf[256];
   size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, CENTRAL, 0, g_seq_orders++, &p, sizeof(p), buf, sizeof(buf));
@@ -986,6 +1021,13 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 
     const uint32_t nowMs = millis();
 
+    const bool running = (g_game.phase == GP_RUNNING) && (g_engine.phase() == PizzaGameEngine::Phase::Running);
+    // When no game is running, houses/stations should be "inactive": always reject deliveries.
+    if (!running) {
+      sendDeliverResult(s->house_id, /*ok*/false, /*reason*/DR_NO_ORDER);
+      return;
+    }
+
     uint8_t reason = DR_OK;
     uint8_t tagMask = 0;
 
@@ -1002,20 +1044,13 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       }
     }
 
-    // 3) must match an active order (engine when running; legacy per-house mask otherwise)
+    // 3) must match an active order (engine)
     if (reason == DR_OK) {
-      if (g_game.phase == GP_RUNNING && g_engine.phase() == PizzaGameEngine::Phase::Running) {
-        int8_t oidx = g_engine.findActiveOrderIndexByHouse(s->house_id);
-        if (oidx < 0) {
-          reason = DR_NO_ORDER;
-        } else if (!g_engine.validateToppingsForOrderIndex((uint8_t)oidx, tagMask)) {
-          reason = DR_WRONG_PIZZA;
-        }
-      } else {
-        // Legacy validator (manual testing without engine)
-        uint8_t expected = g_orderMask[s->house_id];
-        if (expected == MASK_NONE)      reason = DR_NO_ORDER;
-        else if (tagMask != expected)  reason = DR_WRONG_PIZZA;
+      int8_t oidx = g_engine.findActiveOrderIndexByHouse(s->house_id);
+      if (oidx < 0) {
+        reason = DR_NO_ORDER;
+      } else if (!g_engine.validateToppingsForOrderIndex((uint8_t)oidx, tagMask)) {
+        reason = DR_WRONG_PIZZA;
       }
     }
 
@@ -1040,17 +1075,12 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 
     } else {
       // Wrong delivery costs a life only when a run is active
-      if (g_game.phase == GP_RUNNING && g_engine.phase() == PizzaGameEngine::Phase::Running) {
-        bool changed = g_engine.onDeliveryResult(s->house_id, /*ok*/false, reason, nowMs);
-        if (changed) {
-          ordersPushWindowDripStart(/*maxDisplay*/3, ORD_DRIP_START_DELAY_MS);
-        }
-        if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
-          gameStop();
-        }
-      } else {
-        // legacy: uses central's life counter (if any)
-        gameLoseLife(reason);
+      bool changed = g_engine.onDeliveryResult(s->house_id, /*ok*/false, reason, nowMs);
+      if (changed) {
+        ordersPushWindowDripStart(/*maxDisplay*/3, ORD_DRIP_START_DELAY_MS);
+      }
+      if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
+        gameStop();
       }
     }
     return;
@@ -1162,7 +1192,7 @@ static void printHelp() {
 
   // Game
   Serial.println(F("Game"));
-  Serial.println(F("  game start [minutes]           Start a timed run (default from `game minutes`, initial 6)"));
+  Serial.println(F("  game start [minutes] [level]   Start a timed run (level defaults to 1; use for testing)"));
   Serial.println(F("  game stop                      End game and clear orders"));
   Serial.println(F("  game status                    Print current game state"));
   Serial.println(F("  game next                      Debug: print status (levels auto-advance)"));
@@ -1220,12 +1250,20 @@ void setup() {
   g_engine.begin(io);
   g_engine.bindOrdersBuffer(g_orders, PZ_ORDERS_MAX, &g_orderCount);
 
+  // Idle baseline: houses dark + panels off, stations show no orders.
+  ordersResetLocal();
+  housesAllOff();
+  ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
+
   // Help
   Serial.println(F("Type 'help' for commands."));
 }
 
 void loop() {
   PizzaNow::loop();
+
+  // Non-blocking game-over window animation (if active)
+  gameOverFxTick();
 
   gameTick();
   ordersPushWindowDripTick();
