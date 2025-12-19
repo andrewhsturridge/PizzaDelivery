@@ -38,6 +38,14 @@ static Adafruit_NeoPixel neopixelRing(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NE
 static uint16_t g_seq = 1;
 static uint32_t g_helloDueAt = 0;
 
+// Central broadcast: game idle vs running. Player interactions are disabled unless phase==1.
+static volatile uint8_t g_gamePhase = 0;     // 0=Idle, 1=Running, 2=Over
+static uint8_t          g_prevGamePhase = 255;
+
+// Protect shared order state updated in ESPNOW callback.
+static portMUX_TYPE g_osMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool g_osDirty = false; // request a UI refresh from loop()
+
 // ===== Orders window (max 3 items displayed/cycled) =====
 static PzOrderItemSetPayload OS_orders[3];       // 0..2
 static uint32_t              OS_recvMs[3] = {0}; // when ITEM_SET last received per slot
@@ -112,10 +120,13 @@ static void showNoOrders(bool force = false) {
 static uint16_t OS_remainS(uint8_t slot) {
   if (slot >= 3) return 0;
 
-  uint16_t base = OS_orders[slot].remain_s;
+  uint16_t base = 0;
+  uint32_t rx = 0;
+  portENTER_CRITICAL(&g_osMux);
+  base = OS_orders[slot].remain_s;
+  rx = OS_recvMs[slot];
+  portEXIT_CRITICAL(&g_osMux);
   if (base == 0) return 0;
-
-  uint32_t rx = OS_recvMs[slot];
   if (rx == 0) return base;
 
   uint32_t elapsedS = (millis() - rx) / 1000UL;
@@ -127,20 +138,31 @@ static uint16_t OS_remainS(uint8_t slot) {
 static bool OS_buildDisplayForSlot(uint8_t slot, char* out, size_t outSz) {
   if (!out || outSz == 0) return false;
 
-  if (OS_count == 0 || OS_loading) {
+  uint8_t count = 0;
+  bool loading = false;
+  PzOrderItemSetPayload item{};
+
+  portENTER_CRITICAL(&g_osMux);
+  count = OS_count;
+  loading = OS_loading;
+  if (count > 0 && !loading) {
+    if (slot >= count) slot = 0;
+    item = OS_orders[slot];
+  }
+  portEXIT_CRITICAL(&g_osMux);
+
+  if (count == 0 || loading) {
     strlcpy(out, "IDLE", outSz);
     return true;
   }
-  if (slot >= OS_count) slot = 0;
 
-  const char* t = OS_orders[slot].text;
-  if (!t[0]) {
+  if (!item.text[0]) {
     // Item has not arrived yet
     return false;
   }
 
   // Always show the clue text only.
-  strlcpy(out, t, outSz);
+  strlcpy(out, item.text, outSz);
   return true;
 }
 
@@ -150,21 +172,53 @@ static bool OS_buildDisplayForSlot(uint8_t slot, char* out, size_t outSz) {
 static void OS_tickRing() {
   if (otaActive) return; // OTA owns the ring
 
+  // Game idle => ring must stay off.
+  if (g_gamePhase != 1) {
+    neoRingClear();
+    return;
+  }
+
   uint32_t now = millis();
   if ((int32_t)(now - OS_nextRingMs) < 0) return;
   OS_nextRingMs = now + 50; // ~20 Hz
 
-  // Nothing to show
-  if (OS_count == 0 || OS_loading) {
+  // Snapshot order state (callback may update asynchronously)
+  uint8_t  count = 0;
+  bool     loading = false;
+  uint8_t  slot = 0;
+  uint16_t total = 0;
+  uint16_t base  = 0;
+  uint32_t rx    = 0;
+
+  portENTER_CRITICAL(&g_osMux);
+  count   = OS_count;
+  loading = OS_loading;
+  slot    = OS_index;
+  if (count > 0 && slot >= count) slot = 0;
+  if (count > 0 && !loading) {
+    total = OS_totalS[slot];
+    base  = OS_orders[slot].remain_s;
+    rx    = OS_recvMs[slot];
+  }
+  portEXIT_CRITICAL(&g_osMux);
+
+  if (count == 0 || loading) {
     neoRingClear();
     return;
   }
-  if (OS_index >= OS_count) OS_index = 0;
 
-  uint8_t slot = OS_index;
-  uint16_t rem = OS_remainS(slot);
-  uint16_t total = OS_totalS[slot];
-  if (total == 0) total = OS_orders[slot].remain_s;
+  if (base == 0) {
+    neoRingClear();
+    return;
+  }
+
+  uint16_t rem = base;
+  if (rx != 0) {
+    uint32_t elapsedS = (now - rx) / 1000UL;
+    rem = (elapsedS >= base) ? 0 : (uint16_t)(base - elapsedS);
+  }
+
+  if (total == 0) total = base;
   if (total == 0) {
     neoRingClear();
     return;
@@ -175,14 +229,10 @@ static void OS_tickRing() {
   if (rem > 0 && lit == 0) lit = 1;
   if (lit > NEOPIXEL_COUNT) lit = NEOPIXEL_COUNT;
 
-  // Color by urgency
+  // Color by urgency (blink in the last 10s)
   uint32_t col = neopixelRing.Color(0, 40, 0); // green
   if (rem <= 10) {
-    bool on = true;
-    if (rem <= 5) {
-      // blink @ 5 Hz when critical
-      on = ((now / 100) & 1) == 0;
-    }
+    bool on = (rem <= 5) ? (((now / 100) & 1) == 0) : (((now / 250) & 1) == 0);
     col = on ? neopixelRing.Color(60, 0, 0) : 0;
   }
 
@@ -317,10 +367,18 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     return;
   }
 
+  // Central broadcast: game idle vs running.
+  if (hdr.type == GAME_STATE && len >= sizeof(GameStatePayload)) {
+    const GameStatePayload* gs = (const GameStatePayload*)payload;
+    g_gamePhase = gs->phase;
+    return;
+  }
+
   // === ORDERS: window RESET ===
   if (hdr.type == ORDER_LIST_RESET && len >= sizeof(PzOrderListResetPayload)) {
     const PzOrderListResetPayload* r = (const PzOrderListResetPayload*)payload;
 
+    portENTER_CRITICAL(&g_osMux);
     OS_count   = (r->count > 3) ? 3 : r->count;
     OS_index   = 0;
     OS_loading = (OS_count > 0);
@@ -330,6 +388,7 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       OS_orders[i].house_id = 0;
       OS_orders[i].mask     = 0;
       OS_orders[i].text[0]  = '\0';
+      OS_orders[i]._pad0    = 0;
       OS_orders[i].order_id = 0;
       OS_orders[i].remain_s = 0;
       OS_recvMs[i] = 0;
@@ -338,20 +397,48 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 
     OS_lastText[0] = '\0';
     OS_nextRingMs = 0;
+    g_osDirty = true;
+    portEXIT_CRITICAL(&g_osMux);
 
     Serial.printf("[OS] RESET: count=%u (loading=%u)\n", OS_count, OS_loading);
-    if (OS_count == 0) OS_showCurrent(true);
     return;
   }
 
   // === ORDERS: item arrives ===
-  if (hdr.type == ORDER_ITEM_SET && len >= PZ_ORDER_ITEM_V1_SIZE) {
+  // Accept both the legacy (no-pad) and current (explicit-pad) wire formats.
+  // Minimum: index+house+mask + text[]
+  const uint16_t kMinOrderWire = 3 + PZ_ORDER_TEXT_MAX;
+  if (hdr.type == ORDER_ITEM_SET && len >= kMinOrderWire) {
     PzOrderItemSetPayload tmp{};
-    size_t toCopy = (len < sizeof(tmp)) ? len : sizeof(tmp);
-    memcpy(&tmp, payload, toCopy);
+    tmp.index   = payload[0];
+    tmp.house_id = payload[1];
+    tmp.mask    = payload[2];
+    memcpy(tmp.text, payload + 3, PZ_ORDER_TEXT_MAX);
+    tmp.text[PZ_ORDER_TEXT_MAX - 1] = '\0';
+
+    uint16_t orderId = 0;
+    uint16_t remainS = 0;
+
+    // Current (v2) wire: explicit pad byte then order_id/remain_s
+    if (len >= (uint16_t)(kMinOrderWire + 1 + 4)) {
+      tmp._pad0 = payload[kMinOrderWire];
+      memcpy(&orderId, payload + kMinOrderWire + 1, sizeof(orderId));
+      memcpy(&remainS, payload + kMinOrderWire + 3, sizeof(remainS));
+    }
+    // Legacy (v1) wire: no pad, directly order_id/remain_s
+    else if (len >= (uint16_t)(kMinOrderWire + 4)) {
+      tmp._pad0 = 0;
+      memcpy(&orderId, payload + kMinOrderWire, sizeof(orderId));
+      memcpy(&remainS, payload + kMinOrderWire + 2, sizeof(remainS));
+    }
+
+    tmp.order_id = orderId;
+    tmp.remain_s = remainS;
 
     if (tmp.index < 3) {
-      uint16_t prevId = OS_orders[tmp.index].order_id;
+      uint16_t prevId = 0;
+      portENTER_CRITICAL(&g_osMux);
+      prevId = OS_orders[tmp.index].order_id;
       OS_orders[tmp.index] = tmp;
       OS_recvMs[tmp.index] = millis();
 
@@ -368,14 +455,13 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
         OS_totalS[tmp.index] = 0;
       }
 
+      OS_loading = false;
+      g_osDirty = true;
+      portEXIT_CRITICAL(&g_osMux);
+
       Serial.printf("[OS] ITEM_SET: i=%u H%u mask=0x%02X order_id=%u remain=%us text=\"%s\"\n",
                     tmp.index, tmp.house_id, tmp.mask,
                     (unsigned)tmp.order_id, (unsigned)tmp.remain_s, tmp.text);
-
-      OS_loading = false;
-      if (tmp.index == OS_index || tmp.index == 0) {
-        OS_showCurrent(true);
-      }
     }
     return;
   }
@@ -470,7 +556,58 @@ void loop() {
     }
   }
 
+  // --- GAME_STATE edge handling ---
+  if (g_gamePhase != g_prevGamePhase) {
+    uint8_t newPhase = g_gamePhase;
+    g_prevGamePhase = newPhase;
+
+    if (newPhase != 1) {
+      // Game idle/over: clear local state and keep all player-facing outputs quiet.
+      portENTER_CRITICAL(&g_osMux);
+      OS_count = 0;
+      OS_index = 0;
+      OS_loading = false;
+      for (uint8_t i = 0; i < 3; ++i) {
+        OS_orders[i].index = i;
+        OS_orders[i].house_id = 0;
+        OS_orders[i].mask = 0;
+        OS_orders[i]._pad0 = 0;
+        OS_orders[i].order_id = 0;
+        OS_orders[i].remain_s = 0;
+        memset(OS_orders[i].text, 0, sizeof(OS_orders[i].text));
+        OS_totalS[i] = 0;
+        OS_recvMs[i] = 0;
+      }
+      OS_lastText[0] = '\0';
+      OS_nextRingMs = 0;
+      g_osDirty = true;
+      portEXIT_CRITICAL(&g_osMux);
+
+      digitalWrite(LAMP_PIN, HIGH); // lamp off (active-low)
+      neoRingClear();
+    } else {
+      // Game resumed; force a redraw on next loop.
+      g_osDirty = true;
+    }
+  }
+
+  // If ESPNOW callback updated orders, do the UI refresh from loop().
+  if (g_osDirty) {
+    portENTER_CRITICAL(&g_osMux);
+    bool doRefresh = g_osDirty;
+    g_osDirty = false;
+    portEXIT_CRITICAL(&g_osMux);
+
+    if (doRefresh) {
+      OS_showCurrent(true);
+    }
+  }
+
   // === ORDER STATION: debounced button handler (90ms), no delay() ===
+  // Player input is only allowed while the game is RUNNING (phase==1).
+  // Also disable input during OTA so the ring/lamp aren't fought over.
+  const bool inputEnabled = (g_gamePhase == 1) && !otaActive;
+
   bool raw = digitalRead(BTN_PIN);
   if (raw != g_lastRaw) {
     g_lastRaw = raw;
@@ -481,15 +618,31 @@ void loop() {
     if (raw != g_btn) {
       g_btn = raw;
       if (g_btn == LOW) {
-        lampPulseStart(60);
-
-        if (OS_count == 0 || OS_loading) {
-          Serial.println("[OS] press ignored (no items or still loading)");
+        if (!inputEnabled) {
+          Serial.println("[OS] press ignored (game idle)");
         } else {
-          if (OS_index >= OS_count) OS_index = 0;
-          OS_index = (OS_index + 1) % OS_count;
-          Serial.printf("[OS] PRESS -> index=%u of %u\n", OS_index, OS_count);
-          OS_showCurrent(true);
+          uint8_t count = 0;
+          bool loading = false;
+          uint8_t idx = 0;
+
+          portENTER_CRITICAL(&g_osMux);
+          count = OS_count;
+          loading = OS_loading;
+          idx = OS_index;
+          if (count > 0 && idx >= count) idx = 0;
+          if (count > 0 && !loading) {
+            idx = (idx + 1) % count;
+            OS_index = idx;
+          }
+          portEXIT_CRITICAL(&g_osMux);
+
+          if (count == 0 || loading) {
+            Serial.println("[OS] press ignored (no items or still loading)");
+          } else {
+            Serial.printf("[OS] PRESS -> index=%u of %u\n", idx, count);
+            OS_showCurrent(false);
+            lampPulseStart(60);
+          }
         }
       }
     }

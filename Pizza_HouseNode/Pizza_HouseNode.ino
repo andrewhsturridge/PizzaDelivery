@@ -234,6 +234,9 @@ static void ensureBeepWavs() {
 enum Effect { EFFECT_NONE, EFFECT_OK_PULSE, EFFECT_ERR_PULSE, EFFECT_YELLOW_PING };
 static Effect   g_fx      = EFFECT_NONE;
 static uint32_t g_fxUntil = 0;   // millis() deadline for one-shot effects
+// When a one-shot overlay starts, we render it once and keep it static until expiry.
+// This avoids hammering strip.show() at audio-rate, which can cause crackly audio.
+static bool     g_fxDirty = false;
 
 // After a one-shot pulse (success/fail/ping), restore the house's identity window.
 // This fixes the issue where the pulse would leave the window "stuck" off.
@@ -267,7 +270,8 @@ static bool     g_animFlip  = false;
 static float    g_animPhase = 0.0f;
 static uint8_t  g_animHue   = 0;
 
-static TaskHandle_t g_audioTask = nullptr;
+// NOTE: All audio (play/stop/loop) is driven from the main loop()
+// to avoid race conditions with ESPNOW callbacks.
 
 // --- Speaker identity beacon (quiet periodic audio) ---
 static bool     g_beaconEnabled   = false;
@@ -276,16 +280,26 @@ static uint8_t  g_beaconVol       = 70;
 static uint32_t g_beaconPeriodMs  = 2600;   // base period between beacons
 static uint32_t g_beaconNextAt    = 0;
 
+// --- Game gating ---
+// Central broadcasts GAME_STATE so stations can hard-disable player inputs when the game is idle.
+// 0=Idle, 1=Running, 2=Over
+static volatile uint8_t g_gamePhase = 0;
+static uint8_t          g_prevGamePhase = 255;
+
+// --- Deferred RX work (avoid heavy work inside ESPNOW callback) ---
+static portMUX_TYPE g_pendMux = portMUX_INITIALIZER_UNLOCKED;
+
+static volatile bool g_pendDeliver = false;
+static DeliverResultPayload g_pendDeliverPayload;
+
+static volatile bool g_pendSound = false;
+static SoundPlayPayload g_pendSoundPayload;
+
+static volatile bool g_pendDigital = false;
+static HouseDigitalSetPayload g_pendDigitalPayload;
+
 // Forward declares
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t srcMac[6]);
-
-static void audioTask(void*){
-  // High-ish priority, very lightweight loop
-  for(;;){
-    PizzaAudioFS::loop();
-    vTaskDelay(1); // ~1ms yield keeps buffers happy
-  }
-}
 
 static void fillBeep() {
   const float freq = 1000.0f, sr = 22050.0f;
@@ -492,23 +506,21 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     return;
   }
 
+  // Central broadcast: game is Running/Idle. Used to hard-disable player input when idle.
+  if (hdr.type == GAME_STATE && len >= sizeof(GameStatePayload)) {
+    const GameStatePayload* gs = (const GameStatePayload*)payload;
+    g_gamePhase = gs->phase;
+    return;
+  }
+
   /*** onRx: delivery verdict from Central ***/
   if (hdr.type == DELIVER_RESULT && len >= sizeof(DeliverResultPayload)) {
-    const DeliverResultPayload* r = (const DeliverResultPayload*)payload;
     if (hdr.house_id == g_houseId) {
-      g_haveResult = true;
-      g_lastOk     = (r->ok != 0);
-      g_lastReason = r->reason;
-
-      if (g_lastOk) {
-        g_fx = EFFECT_OK_PULSE; g_fxUntil = millis() + 600;
-        playResultBeep(true, 180);           // <— play OK beep
-        PZ_LOGI("DELIVER_RESULT OK");
-      } else {
-        g_fx = EFFECT_ERR_PULSE; g_fxUntil = millis() + 600;
-        playResultBeep(false, 160);          // <— play ERR beep
-        PZ_LOGI("DELIVER_RESULT ERR reason=%u", r->reason);
-      }
+      const DeliverResultPayload* r = (const DeliverResultPayload*)payload;
+      portENTER_CRITICAL(&g_pendMux);
+      g_pendDeliverPayload = *r;
+      g_pendDeliver = true;
+      portEXIT_CRITICAL(&g_pendMux);
     }
     return;
   }
@@ -516,13 +528,10 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
   if (hdr.type == SOUND_PLAY && len >= sizeof(SoundPlayPayload)) {
     const SoundPlayPayload* sp = (const SoundPlayPayload*)payload;
     if (sp->house_id == g_houseId) {
-      uint8_t vol = sp->vol ? sp->vol : 200;
-      PizzaAudioFS::setVolume(vol);
-      if (!PizzaAudioFS::playClip(sp->clip_id, /*loop=*/false)) {
-        Serial.printf("[House %u] SOUND_PLAY: missing /clips/%03u.wav\n", g_houseId, sp->clip_id);
-      }
-      g_fx = EFFECT_YELLOW_PING; g_fxUntil = millis() + 240;
-      PZ_LOGI("SOUND_PLAY clip=%u vol=%u", sp->clip_id, vol);
+      portENTER_CRITICAL(&g_pendMux);
+      g_pendSoundPayload = *sp;
+      g_pendSound = true;
+      portEXIT_CRITICAL(&g_pendMux);
     }
     return;
   }
@@ -562,47 +571,11 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
   if (hdr.type == HOUSE_DIGITAL_SET && len >= sizeof(HouseDigitalSetPayload)) {
     const HouseDigitalSetPayload* p = (const HouseDigitalSetPayload*)payload;
     if (p->house_id == g_houseId) {
-      // Window LEDs
-      if (p->flags & 0x01) {
-        applyWindow(p->win_fx, p->win_h, p->win_s, p->win_v, p->win_speed);
-      }
-
-      // Speaker (FS-based audio)
-      // NOTE: To avoid audio overload, we interpret spk_flags bit0 as
-      // "beacon identity enabled" (periodic playback), NOT a continuous loop.
-      if (p->flags & 0x04) {
-        if (p->spk_flags & 0x02) {
-          // stop + disable beacon
-          g_beaconEnabled = false;
-          g_beaconClip = 0;
-          PizzaAudioFS::stop();
-        } else {
-          PizzaAudioFS::setVolume(p->spk_vol);
-
-          // clip 0 means "silent"
-          if (p->spk_clip == 0) {
-            g_beaconEnabled = false;
-            g_beaconClip = 0;
-            PizzaAudioFS::stop();
-          } else if (p->spk_flags & 0x01) {
-            // Beacon mode: play briefly every few seconds (staggered per house)
-            g_beaconEnabled = true;
-            g_beaconClip = p->spk_clip;
-            g_beaconVol  = p->spk_vol;
-
-            uint32_t now = millis();
-            uint32_t jitter = (uint32_t)(esp_random() % 160); // 0..159ms
-            g_beaconNextAt = now + 200 + (uint32_t)g_houseId * 180 + jitter;
-          } else {
-            // One-shot play (no beacon)
-            g_beaconEnabled = false;
-            g_beaconClip = 0;
-            if (!PizzaAudioFS::playClip(p->spk_clip, /*loop=*/false)) {
-              Serial.printf("[House %u] Missing /clips/%03u.wav – no audio\n", g_houseId, p->spk_clip);
-            }
-          }
-        }
-      }
+      // Defer heavy LED/audio work to loop() (ESPNOW callback should stay lean).
+      portENTER_CRITICAL(&g_pendMux);
+      g_pendDigitalPayload = *p;
+      g_pendDigital = true;
+      portEXIT_CRITICAL(&g_pendMux);
     }
     return;
   }
@@ -690,6 +663,12 @@ static void nodeOtaProgress(size_t written, size_t total) {
 }
 
 void setup() {
+  #if defined(ARDUINO_ARCH_ESP32)
+    // Keep CPU at full speed while the game is running.
+    // This reduces audio underruns when WiFi/NeoPixels are active.
+    setCpuFrequencyMhz(240);
+  #endif
+
   Serial.begin(115200);
   delay(250);  // let USB/serial settle
 
@@ -732,9 +711,8 @@ void setup() {
   // AUDIO last
   PizzaAudioFS::begin(I2S_BCLK, I2S_LRCK, I2S_DOUT);
   ensureBeepWavs();
-  PizzaAudioFS::setVolume(180);
-  // run audio loop on the other core so it’s always serviced
-  xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, 3, &g_audioTask, 0);
+  PizzaAudioFS::setVolume(10);
+  // Audio is serviced from loop() (single-threaded) to avoid race conditions.
 
   PZ_LOGI("Node init complete");
 }
@@ -745,6 +723,109 @@ void loop() {
   if (g_helloDueAt && (int32_t)(millis() - g_helloDueAt) >= 0) {
     sendHello();
     g_helloDueAt = 0;
+  }
+
+  // --- GAME_STATE edge handling ---
+  if (g_gamePhase != g_prevGamePhase) {
+    uint8_t newPhase = g_gamePhase;
+    g_prevGamePhase = newPhase;
+
+    // When the game is not Running, hard-disable player scans.
+    if (newPhase != 1) {
+      g_state = HS_IDLE;
+      g_haveResult = false;
+      g_absentSince = 0;
+    } else {
+      // On enable, require card removal before allowing a scan.
+      g_state = HS_WAIT_REMOVAL;
+      g_haveResult = false;
+      g_absentSince = 0;
+    }
+  }
+
+  // --- Apply deferred RX work (keeps ESPNOW callback lean + avoids audio races) ---
+  HouseDigitalSetPayload pendDigital{};
+  SoundPlayPayload       pendSound{};
+  DeliverResultPayload   pendResult{};
+  bool doDigital = false, doSound = false, doResult = false;
+
+  portENTER_CRITICAL(&g_pendMux);
+  if (g_pendDigital) { pendDigital = g_pendDigitalPayload; g_pendDigital = false; doDigital = true; }
+  if (g_pendSound)   { pendSound   = g_pendSoundPayload;   g_pendSound   = false; doSound   = true; }
+  if (g_pendDeliver) { pendResult  = g_pendDeliverPayload; g_pendDeliver = false; doResult  = true; }
+  portEXIT_CRITICAL(&g_pendMux);
+
+  if (doDigital) {
+    // Window LEDs
+    if (pendDigital.flags & 0x01) {
+      applyWindow(pendDigital.win_fx, pendDigital.win_h, pendDigital.win_s, pendDigital.win_v, pendDigital.win_speed);
+    }
+
+    // Speaker (FS-based audio)
+    // NOTE: To avoid audio overload, we interpret spk_flags bit0 as
+    // "beacon identity enabled" (periodic playback), NOT a continuous loop.
+    if (pendDigital.flags & 0x04) {
+      if (pendDigital.spk_flags & 0x02) {
+        // stop + disable beacon
+        g_beaconEnabled = false;
+        g_beaconClip = 0;
+        PizzaAudioFS::stop();
+      } else {
+        PizzaAudioFS::setVolume(pendDigital.spk_vol);
+
+        // clip 0 means "silent"
+        if (pendDigital.spk_clip == 0) {
+          g_beaconEnabled = false;
+          g_beaconClip = 0;
+          PizzaAudioFS::stop();
+        } else if (pendDigital.spk_flags & 0x01) {
+          // Beacon mode: play briefly every few seconds (staggered per house)
+          g_beaconEnabled = true;
+          g_beaconClip = pendDigital.spk_clip;
+          g_beaconVol  = pendDigital.spk_vol;
+
+          uint32_t now = millis();
+          uint32_t jitter = (uint32_t)(esp_random() % 160); // 0..159ms
+          g_beaconNextAt = now + 200 + (uint32_t)g_houseId * 180 + jitter;
+        } else {
+          // One-shot play (no beacon)
+          g_beaconEnabled = false;
+          g_beaconClip = 0;
+          if (!PizzaAudioFS::playClip(pendDigital.spk_clip, /*loop=*/false)) {
+            Serial.printf("[House %u] Missing /clips/%03u.wav – no audio\n", g_houseId, pendDigital.spk_clip);
+          }
+        }
+      }
+    }
+  }
+
+  if (doSound) {
+    uint8_t vol = pendSound.vol ? pendSound.vol : 10;
+    PizzaAudioFS::setVolume(vol);
+    if (!PizzaAudioFS::playClip(pendSound.clip_id, /*loop=*/false)) {
+      Serial.printf("[House %u] SOUND_PLAY: missing /clips/%03u.wav\n", g_houseId, pendSound.clip_id);
+    }
+    g_fx = EFFECT_YELLOW_PING;
+    g_fxUntil = millis() + 240;
+    g_fxDirty = true;
+  }
+
+  if (doResult) {
+    g_haveResult = true;
+    g_lastOk     = (pendResult.ok != 0);
+    g_lastReason = pendResult.reason;
+
+    if (g_lastOk) {
+      g_fx = EFFECT_OK_PULSE; g_fxUntil = millis() + 600;
+      g_fxDirty = true;
+      playResultBeep(true, 30);
+      PZ_LOGI("DELIVER_RESULT OK");
+    } else {
+      g_fx = EFFECT_ERR_PULSE; g_fxUntil = millis() + 600;
+      g_fxDirty = true;
+      playResultBeep(false, 28);
+      PZ_LOGI("DELIVER_RESULT ERR reason=%u", pendResult.reason);
+    }
   }
 
   if (g_otaPending) {
@@ -788,7 +869,18 @@ void loop() {
   /*** Delivery FSM tick ***/
   static uint32_t nextPoll = 0;
   if ((int32_t)(millis() - nextPoll) >= 0) {
-    nextPoll = millis() + 50; // ~20 Hz check; readUid() already gates on field presence
+    const bool audioBusyPoll = PizzaAudioFS::isPlaying();
+    nextPoll = millis() + (audioBusyPoll ? 120 : 50); // slow RFID polling slightly while audio plays
+
+    const bool inputEnabled = (g_gamePhase == 1) && (g_houseId != 0);
+    if (!inputEnabled) {
+      // Game idle (or unclaimed) => ignore all scans; keep station quiet.
+      g_state = HS_IDLE;
+      g_haveResult = false;
+      g_absentSince = 0;
+      // (No RFID reads here; just do nothing until the game enables input.)
+      goto _skip_delivery_fsm;
+    }
 
     switch (g_state) {
       case HS_IDLE: {
@@ -812,6 +904,7 @@ void loop() {
           // Timeout behaves like a fail → require removal
           g_lastOk = false; g_lastReason = 0xFE; // pseudo "timeout"
           g_fx = EFFECT_ERR_PULSE; g_fxUntil = millis() + 600;
+          g_fxDirty = true;
           g_absentSince = 0;
           g_state = HS_WAIT_REMOVAL;
         }
@@ -830,6 +923,7 @@ void loop() {
         }
       } break;
     }
+_skip_delivery_fsm:;
   }
 
   // LED effects (no heartbeat; idle = off)
@@ -838,30 +932,43 @@ void loop() {
   switch (g_fx) {
     case EFFECT_OK_PULSE:
       if (now <= g_fxUntil) {
-        for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, strip.Color(0,64,0));
-        strip.show();
+        // Render once and hold.
+        if (g_fxDirty) {
+          for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, strip.Color(0,64,0));
+          strip.show();
+          g_fxDirty = false;
+        }
       } else {
         g_fx = EFFECT_NONE;
+        g_fxDirty = false;
         restoreWindowIdentity();
       }
       break;
 
     case EFFECT_ERR_PULSE:
       if (now <= g_fxUntil) {
-        for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, strip.Color(64,0,0));
-        strip.show();
+        if (g_fxDirty) {
+          for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, strip.Color(64,0,0));
+          strip.show();
+          g_fxDirty = false;
+        }
       } else {
         g_fx = EFFECT_NONE;
+        g_fxDirty = false;
         restoreWindowIdentity();
       }
       break;
 
     case EFFECT_YELLOW_PING:
       if (now <= g_fxUntil) {
-        for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, strip.Color(80,80,0));
-        strip.show();
+        if (g_fxDirty) {
+          for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, strip.Color(80,80,0));
+          strip.show();
+          g_fxDirty = false;
+        }
       } else {
         g_fx = EFFECT_NONE;
+        g_fxDirty = false;
         restoreWindowIdentity();
       }
       break;
@@ -874,11 +981,15 @@ void loop() {
 
   // Only drive window animations when we're not in the middle of a result/ping pulse.
   if (g_fx == EFFECT_NONE) {
+    // When audio is playing, reduce LED refresh rate slightly to avoid starving I2S.
+    const bool audioBusy = PizzaAudioFS::isPlaying();
+
     auto fxInterval = [&](uint8_t spd, uint16_t fastMs, uint16_t slowMs) -> uint16_t {
       // spd 0..255, 255 fastest
       if (fastMs >= slowMs) return fastMs;
       uint32_t span = (uint32_t)(slowMs - fastMs);
       uint32_t v = slowMs - (uint32_t)spd * span / 255U;
+      if (audioBusy && v < 110) v = 110; // clamp to ~9fps while audio plays
       return (uint16_t)v;
     };
 
@@ -952,7 +1063,7 @@ void loop() {
           uint32_t c = hsv2rgb(g_winH, g_winS?g_winS:255, v);
           for (uint16_t i=0;i<LED_COUNT;i++) strip.setPixelColor(i, c);
           strip.show();
-          g_nextFxAt = now + 30;
+          g_nextFxAt = now + (audioBusy ? 110 : 30);
         } break;
 
         case WIN_FX_STROBE: {

@@ -144,6 +144,52 @@ struct OrdersDrip {
 };
 static OrdersDrip s_ordersDrip = {false,0,0,0,0};
 
+// --- GAME_STATE broadcaster (Central -> ALL) ---
+// Player-interactive stations (HOUSE_NODE / ORDERS_NODE / PIZZA_NODE) should hard-disable inputs
+// unless phase == Running.
+static uint32_t g_gameStateDueAt = 0;
+static uint8_t  g_gameStateBurstLeft = 0;
+
+static void sendGameStateNow() {
+  GameStatePayload p{};
+  // Compute phase from Central + Engine (engine is source of truth while running).
+  if (g_game.phase == GP_RUNNING && g_engine.phase() == PizzaGameEngine::Phase::Running) {
+    p.phase = 1;
+  } else if (g_game.phase == GP_OVER || g_engine.phase() == PizzaGameEngine::Phase::Over) {
+    p.phase = 2;
+  } else {
+    p.phase = 0;
+  }
+  p.level = g_engine.level();
+  p.rsv0 = 0; p.rsv1 = 0;
+
+  uint8_t buf[64];
+  size_t n = PizzaProtocol::pack(GAME_STATE, CENTRAL, 0, g_seq++, &p, sizeof(p), buf, sizeof(buf));
+  if (n) PizzaNow::sendBroadcast(buf, n);
+}
+
+static void requestGameStateBurst(uint8_t count = 4) {
+  g_gameStateBurstLeft = count;
+  g_gameStateDueAt = millis();
+}
+
+static void gameStateTick() {
+  const uint32_t now = millis();
+
+  if (g_gameStateBurstLeft) {
+    if ((int32_t)(now - g_gameStateDueAt) < 0) return;
+    sendGameStateNow();
+    g_gameStateBurstLeft--;
+    g_gameStateDueAt = now + (g_gameStateBurstLeft ? 40 : 1000);
+    return;
+  }
+
+  if ((int32_t)(now - g_gameStateDueAt) < 0) return;
+  // Periodic keepalive in case any station missed the edge.
+  sendGameStateNow();
+  g_gameStateDueAt = now + 1000;
+}
+
 ///// forward declarations /////
 static void ordersPushWindow(uint8_t maxDisplay = 3);
 static void ordersPushWindowDripStart(uint8_t maxDisplay, uint16_t startDelayMs = 0);
@@ -212,6 +258,9 @@ static void gameStart(uint16_t minutes, uint8_t level){
   // Broadcast first order window (OrdersStation will start countdown from remain_s)
   ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
 
+  // Let all player stations know the run is live (and repeat a few times for reliability).
+  requestGameStateBurst(6);
+
   g_gameTickDueAt = now + 100;
 
   Serial.println("game: START");
@@ -263,6 +312,7 @@ static void gameOverFxTick() {
     housesAllOff();
     s_goFx.active = false;
     g_game.phase = GP_IDLE;
+    requestGameStateBurst(6);
     Serial.println("game: OVER -> IDLE");
     gamePrintStatus();
   } else {
@@ -279,6 +329,9 @@ static void gameStop(){
 
   // Stop engine + clear active orders
   g_engine.stopGame(now);
+
+  // Immediately disable player inputs everywhere (houses/pizza/order stations).
+  requestGameStateBurst(6);
 
   // Clear list on OrdersStation
   ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
@@ -458,6 +511,7 @@ static void ordersResetLocal() {
     g_orders[i].index = i;
     g_orders[i].house_id = 0;
     g_orders[i].mask = 0;
+    g_orders[i]._pad0 = 0;
     g_orders[i].order_id = 0;
     g_orders[i].remain_s = 0;
     memset(g_orders[i].text, 0, sizeof(g_orders[i].text));
@@ -470,6 +524,7 @@ static bool ordersAddLocal(uint8_t house_id, uint8_t mask, const char* text) {
   it.index = g_orderCount;
   it.house_id = house_id;
   it.mask = mask;
+  it._pad0 = 0;
   it.order_id = 0;
   it.remain_s = 0;
   memset(it.text, 0, sizeof(it.text));
@@ -1254,6 +1309,7 @@ void setup() {
   ordersResetLocal();
   housesAllOff();
   ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
+  requestGameStateBurst(6);
 
   // Help
   Serial.println(F("Type 'help' for commands."));
@@ -1267,6 +1323,7 @@ void loop() {
 
   gameTick();
   ordersPushWindowDripTick();
+  gameStateTick();
 
   String line = readLine();
   if (!line.length()) return;

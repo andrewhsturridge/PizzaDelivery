@@ -1103,6 +1103,9 @@ void PizzaGameEngine::syncPayloadFromInternal(uint32_t nowMs) {
     memset(it.text, 0, sizeof(it.text));
     strlcpy(it.text, st.clueText, sizeof(it.text));
 
+    // Keep protocol wire-format deterministic across toolchains.
+    it._pad0 = 0;
+
     it.order_id = st.orderId;
 
     if (st.expiresAtMs && (int32_t)(st.expiresAtMs - nowMs) > 0) {

@@ -72,8 +72,50 @@ static void showStatus() {
 // Example tokens: "@STAR", "@HEART", "@KEY".
 // -----------------------------
 
+// Accept "@STAR" as well as legacy markup "@<STAR>".
+// Returns true if we can extract a token name (does not guarantee that name is supported).
+static bool extractIconName(const char* s, char* out, size_t outSz) {
+  if (!out || outSz == 0) return false;
+  out[0] = 0;
+  if (!s) return false;
+
+  // Be tolerant of leading whitespace (some servers/payloads pad strings).
+  while (*s && (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')) s++;
+  if (*s != '@') return false;
+
+  const char* p = s + 1;
+  while (*p == ' ' || *p == '\t') p++;
+
+  bool bracketed = false;
+  char closeCh = 0;
+  // Support legacy markup @<STAR> as well as other common bracket styles.
+  if (*p == '<') { bracketed = true; closeCh = '>'; p++; }
+  else if (*p == '[') { bracketed = true; closeCh = ']'; p++; }
+  else if (*p == '{') { bracketed = true; closeCh = '}'; p++; }
+  else if (*p == '(') { bracketed = true; closeCh = ')'; p++; }
+
+  size_t n = 0;
+  while (*p && n + 1 < outSz) {
+    if (bracketed) {
+      if (closeCh && *p == closeCh) break;
+    } else {
+      if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') break;
+    }
+    char c = *p++;
+    // Normalize to uppercase for comparisons. Also skip common punctuation.
+    if (c == '<' || c == '>' || c == '@') continue;
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    // Allow A-Z, 0-9, '_' only. (Drop other chars so @<star> works.)
+    if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) continue;
+    out[n++] = c;
+  }
+  out[n] = 0;
+  return (n > 0);
+}
+
 static bool isIconText(const char* s) {
-  return s && s[0] == '@' && s[1] != '\0';
+  char name[24];
+  return extractIconName(s, name, sizeof(name));
 }
 
 static bool tokenEq(const char* a, const char* b) {
@@ -86,7 +128,7 @@ static bool tokenEq(const char* a, const char* b) {
   return *a == 0 && *b == 0;
 }
 
-static void drawIcon(const char* tok) {
+static void drawIconName(const char* name) {
   // 64x32 coordinate system
   auto& g = PizzaPanel::gfx();
   const uint16_t WHITE = 0xFFFF;
@@ -96,9 +138,8 @@ static void drawIcon(const char* tok) {
   const int cy = 16;
   const int r  = 10;
 
-  // Normalize token (skip leading '@')
-  const char* t = tok;
-  if (t && t[0] == '@') t++;
+  const char* t = name;
+  if (!t) t = "";
 
   // Simple primitives; readable from across the room.
   if (tokenEq(t, "STAR")) {
@@ -172,37 +213,32 @@ static void drawIcon(const char* tok) {
     g.drawLine(cx-10, cy-10, cx+10, cy+10, WHITE);
     g.drawLine(cx-10, cy+10, cx+10, cy-10, WHITE);
   }
-  else {
-    // Unknown icon token -> show as text (fallback)
-    // (We do nothing here; caller will render as text.)
-  }
+  // Unknown -> draw nothing (caller will fall back to text)
 }
 
-static void showIconText(const char* iconTok, uint8_t bright) {
+static bool isKnownIconName(const char* name) {
+  const char* known[] = {"STAR","HEART","CROWN","BOLT","LIGHTNING","SKULL","KEY","SMILE","FROWN","UP","DOWN","CHECK","X"};
+  for (auto k : known) {
+    if (tokenEq(name, k)) return true;
+  }
+  return false;
+}
+
+static void showIconName(const char* iconName, uint8_t bright) {
   // Stop any previous scroll, set brightness, clear, draw icon, show.
   PizzaPanel::setColor(255,255,255);
   PizzaPanel::showText("", /*style*/1, /*speed*/1, bright);
   auto& g = PizzaPanel::gfx();
   g.fillScreen(0);
-  drawIcon(iconTok);
+  drawIconName(iconName);
   PizzaPanel::show();
 }
 
 static void renderPanelText(const char* text, uint8_t style, uint8_t speed, uint8_t bright) {
-  if (isIconText(text)) {
-    // If token is unknown, drawIcon() draws nothing; fall back to text in that case.
-    const char* t = text;
-    if (t && t[0]=='@') {
-      // quick known-token check
-      const char* name = t + 1;
-      const char* known[] = {"STAR","HEART","CROWN","BOLT","LIGHTNING","SKULL","KEY","SMILE","FROWN","UP","DOWN","CHECK","X"};
-      bool ok=false;
-      for (auto k: known) { if (tokenEq(name, k)) { ok=true; break; } }
-      if (ok) {
-        showIconText(text, bright);
-        return;
-      }
-    }
+  char name[24];
+  if (extractIconName(text, name, sizeof(name)) && isKnownIconName(name)) {
+    showIconName(name, bright);
+    return;
   }
 
   // Default text rendering

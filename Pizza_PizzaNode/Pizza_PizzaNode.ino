@@ -52,6 +52,10 @@ static const uint8_t LMP[5] = {2, 15, 27, 12, 5};
 static uint16_t g_seq = 1;
 static uint32_t g_helloDueAt = 0;
 
+// Central broadcast: game idle vs running. Player interactions are disabled unless phase==1.
+static volatile uint8_t g_gamePhase = 0;     // 0=Idle, 1=Running, 2=Over
+static uint8_t          g_prevGamePhase = 255;
+
 // NVS: persistent station id (CLAIM sets this once)
 #include <Preferences.h>
 Preferences prefs;
@@ -219,6 +223,13 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     return;
    }
 
+  // Central broadcast: game idle vs running.
+  if (hdr.type == GAME_STATE && len >= sizeof(GameStatePayload)) {
+    const GameStatePayload* gs = (const GameStatePayload*)payload;
+    g_gamePhase = gs->phase;
+    return;
+  }
+
   // CLAIM (same as houses; sets a persistent station id)
   if (hdr.type == CLAIM && len >= sizeof(ClaimPayload)) {
     const ClaimPayload* cp = (const ClaimPayload*)payload;
@@ -334,6 +345,29 @@ void loop() {
         PizzaNow::sendBroadcast(out, n);
       }
     }
+  }
+
+  // --- GAME_STATE edge handling + input gating ---
+  if (g_gamePhase != g_prevGamePhase) {
+    uint8_t newPhase = g_gamePhase;
+    g_prevGamePhase = newPhase;
+
+    // Always clear local interaction state when entering/leaving a game.
+    g_haveTag = false;
+    g_uidLen = 0;
+    g_mask = 0;
+    lampsApply(0);
+    neoRingClear();
+  }
+
+  // Pizza station is a shared station (not a per-house device).
+  // Some builds never CLAIM this node, so stationId may legitimately be 0.
+  // Gate ONLY on game phase.
+  const bool inputEnabled = (g_gamePhase == 1);
+  if (!inputEnabled) {
+    // Game idle/unclaimed: station should be non-responsive.
+    delay(2);
+    return;
   }
 
   // --- RFID presence / attach / detach ---
