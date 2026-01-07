@@ -96,10 +96,14 @@ static void sendHello() {
 
 // --- Unified: always send ORDER_SHOW_TEXT as if from CENTRAL ---
 static void OS_sendShowTextUnified(const char* s) {
-  const char* safe = (s && *s) ? s : "IDLE";
-
   PzOrderShowTextPayload p{};
-  strlcpy(p.text, safe, sizeof(p.text));
+  // Allow "off" by sending an empty string.
+  // OrdersPanel/HousePanels treat empty text as "blank" (screen off).
+  if (s) {
+    strlcpy(p.text, s, sizeof(p.text));
+  } else {
+    p.text[0] = '\0';
+  }
 
   uint8_t buf[256];
   static uint16_t seq_for_show = 1;
@@ -108,12 +112,13 @@ static void OS_sendShowTextUnified(const char* s) {
   size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, CENTRAL, 0, seq_for_show++,
                                  &p, sizeof(p), buf, sizeof(buf));
   PizzaNow::sendBroadcast(buf, n);
-  Serial.printf("[OS] SHOW -> \"%s\"\n", p.text);
+  Serial.printf("[OS] SHOW -> %s\n", p.text[0] ? p.text : "<OFF>");
 }
 
 static void showNoOrders(bool force = false) {
   (void)force;
-  OS_sendShowTextUnified("IDLE");
+  // Keep display OFF when idle / no orders.
+  OS_sendShowTextUnified("");
 }
 
 // Remaining seconds for a slot, based on the last remain_s received + elapsed millis().
@@ -152,7 +157,8 @@ static bool OS_buildDisplayForSlot(uint8_t slot, char* out, size_t outSz) {
   portEXIT_CRITICAL(&g_osMux);
 
   if (count == 0 || loading) {
-    strlcpy(out, "IDLE", outSz);
+    // Keep blank when there are no orders.
+    out[0] = '\0';
     return true;
   }
 
@@ -167,8 +173,9 @@ static bool OS_buildDisplayForSlot(uint8_t slot, char* out, size_t outSz) {
 }
 
 // Render countdown for the currently selected order on the NeoPixel ring.
-// - Green: >10s
-// - Red:   <=10s (blink faster when <=5s)
+// Simple behavior:
+// - One shrinking ring (green) while >10s remain
+// - Last 10s: red + simple blink (single rate, no "restart")
 static void OS_tickRing() {
   if (otaActive) return; // OTA owns the ring
 
@@ -180,15 +187,13 @@ static void OS_tickRing() {
 
   uint32_t now = millis();
   if ((int32_t)(now - OS_nextRingMs) < 0) return;
-  OS_nextRingMs = now + 50; // ~20 Hz
+  OS_nextRingMs = now + 80; // ~12.5 Hz (smooth enough; less busy)
 
-  // Snapshot order state (callback may update asynchronously)
-  uint8_t  count = 0;
-  bool     loading = false;
-  uint8_t  slot = 0;
+  // Snapshot which slot is active.
+  uint8_t count = 0;
+  bool    loading = false;
+  uint8_t slot = 0;
   uint16_t total = 0;
-  uint16_t base  = 0;
-  uint32_t rx    = 0;
 
   portENTER_CRITICAL(&g_osMux);
   count   = OS_count;
@@ -197,8 +202,6 @@ static void OS_tickRing() {
   if (count > 0 && slot >= count) slot = 0;
   if (count > 0 && !loading) {
     total = OS_totalS[slot];
-    base  = OS_orders[slot].remain_s;
-    rx    = OS_recvMs[slot];
   }
   portEXIT_CRITICAL(&g_osMux);
 
@@ -207,18 +210,16 @@ static void OS_tickRing() {
     return;
   }
 
-  if (base == 0) {
+  const uint16_t rem = OS_remainS(slot);
+  if (rem == 0) {
     neoRingClear();
     return;
   }
 
-  uint16_t rem = base;
-  if (rx != 0) {
-    uint32_t elapsedS = (now - rx) / 1000UL;
-    rem = (elapsedS >= base) ? 0 : (uint16_t)(base - elapsedS);
+  if (total == 0) {
+    // Fallback: if we don't have a seeded total, use current remain.
+    total = rem;
   }
-
-  if (total == 0) total = base;
   if (total == 0) {
     neoRingClear();
     return;
@@ -229,10 +230,11 @@ static void OS_tickRing() {
   if (rem > 0 && lit == 0) lit = 1;
   if (lit > NEOPIXEL_COUNT) lit = NEOPIXEL_COUNT;
 
-  // Color by urgency (blink in the last 10s)
+  // Color/urgency
   uint32_t col = neopixelRing.Color(0, 40, 0); // green
   if (rem <= 10) {
-    bool on = (rem <= 5) ? (((now / 100) & 1) == 0) : (((now / 250) & 1) == 0);
+    // Simple blink at a single rate (~1.4 Hz)
+    bool on = (((now / 350) & 1) == 0);
     col = on ? neopixelRing.Color(60, 0, 0) : 0;
   }
 
@@ -247,9 +249,10 @@ static void OS_showCurrent(bool force) {
   char buf[PZ_ORDER_TEXT_MAX] = {0};
 
   if (OS_count == 0) {
-    if (force || strcmp(OS_lastText, "IDLE") != 0) {
+    // No orders => keep the panel OFF (blank text).
+    if (force || OS_lastText[0] != '\0') {
       showNoOrders(true);
-      strlcpy(OS_lastText, "IDLE", sizeof(OS_lastText));
+      OS_lastText[0] = '\0';
       OS_lastSendMs = millis();
     }
     return;
@@ -442,13 +445,11 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       OS_orders[tmp.index] = tmp;
       OS_recvMs[tmp.index] = millis();
 
-      // Track an estimated total time per order_id for ring progress.
-      // Seed with the first remain_s we see for that order. If Central re-sends
-      // with a larger remain_s (e.g., first wave), keep the max.
+      // Track a stable "total" time per order_id for ring progress.
+      // We seed it ONCE when a new order_id appears and then keep it fixed
+      // so the ring never "restarts" mid-countdown.
       if (tmp.remain_s > 0) {
         if (tmp.order_id != prevId || OS_totalS[tmp.index] == 0) {
-          OS_totalS[tmp.index] = tmp.remain_s;
-        } else if (tmp.remain_s > OS_totalS[tmp.index]) {
           OS_totalS[tmp.index] = tmp.remain_s;
         }
       } else {

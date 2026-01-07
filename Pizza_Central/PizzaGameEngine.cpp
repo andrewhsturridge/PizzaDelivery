@@ -313,35 +313,36 @@ PizzaGameEngine::LevelCfg PizzaGameEngine::levelCfg(uint8_t level) const {
     default:
     case 1:
       c.N_success = 4; c.maxActive = 2;
-      c.timeout_s = 25; c.timeout_firstWave_s = 30; c.firstWaveCount = 2;
+      // Longer per-order timers (more forgiving): v6 tuning
+      c.timeout_s = 45; c.timeout_firstWave_s = 55; c.firstWaveCount = 2;
       c.pizzaTier = PizzaTier::Single;
       c.compositesEnabled = false;
       c.relationsEnabled  = false;
       break;
     case 2:
       c.N_success = 4; c.maxActive = 2;
-      c.timeout_s = 20; c.timeout_firstWave_s = 25; c.firstWaveCount = 2;
+      c.timeout_s = 40; c.timeout_firstWave_s = 50; c.firstWaveCount = 2;
       c.pizzaTier = PizzaTier::Single;
       c.compositesEnabled = true;
       c.relationsEnabled  = false;
       break;
     case 3:
       c.N_success = 5; c.maxActive = 3;
-      c.timeout_s = 18; c.timeout_firstWave_s = 22; c.firstWaveCount = 2;
+      c.timeout_s = 35; c.timeout_firstWave_s = 45; c.firstWaveCount = 2;
       c.pizzaTier = PizzaTier::Multi2;
       c.compositesEnabled = true;
       c.relationsEnabled  = false;
       break;
     case 4:
       c.N_success = 6; c.maxActive = 3;
-      c.timeout_s = 16; c.timeout_firstWave_s = 20; c.firstWaveCount = 2;
+      c.timeout_s = 30; c.timeout_firstWave_s = 40; c.firstWaveCount = 2;
       c.pizzaTier = PizzaTier::Multi3;
       c.compositesEnabled = true;
       c.relationsEnabled  = false;
       break;
     case 5:
       c.N_success = 6; c.maxActive = 3;
-      c.timeout_s = 15; c.timeout_firstWave_s = 20; c.firstWaveCount = 2;
+      c.timeout_s = 28; c.timeout_firstWave_s = 38; c.firstWaveCount = 2;
       c.pizzaTier = PizzaTier::Constraints;
       c.compositesEnabled = true;
       c.relationsEnabled  = true;

@@ -1,3 +1,33 @@
+// =============================================================
+// Pizza Delivery ESP-NOW Central
+//
+// With standardized serial protocol for the main Player Management System (PMS)
+//
+// Standard protocol lines always start with:
+//   !PMS
+//
+// PMS protocol (v1) ***DO NOT REMOVE***:
+//
+//   PMS -> Central:
+//     !PMS PING
+//     !PMS START level=1        (level 1..5; starts run at that level; resets score/lives)
+//     !PMS STOP
+//
+//   Central -> PMS:
+//     !PMS PONG v=1 game=pizza role=server
+//     !PMS STATUS v=1 state=playing level=.. score=.. lives=.. tleft_ms=.. last_reason=..
+//       (STATUS is NOT emitted while idle)
+//     !PMS EVENT v=1 name=game_start level=..
+//     !PMS EVENT v=1 name=game_end reason=timeup|no_lives|stopped score=.. lives=..
+//     !PMS EVENT v=1 name=score delta=.. total=.. bonus=0
+//     !PMS EVENT v=1 name=life delta=-1 lives=..
+//
+// Build toggles (compile-time):
+//   - PMS_STD_ENABLED: enable/disable PMS protocol support
+//   - PMS_DEBUG_SERIAL: when 0, suppress non-!PMS debug/legacy Serial prints (clean PMS output)
+//
+// =============================================================
+
 // Role: CENTRAL (Feather S3)
 // Roster + clean DELIVER_SCAN → DELIVER_RESULT (auto-OK for now).
 // CLI: list | hello-req | panel <id> "text" [style] [speed] [bright] | sound <id> [clip] [vol]
@@ -18,6 +48,59 @@
 #include "BuildConfig.h"
 #include "PizzaNetCfg.h"
 #include "PizzaGameEngine.h"
+
+
+// =============================================================
+// PMS / DEBUG SERIAL TOGGLES
+// =============================================================
+
+// 1 = Enable PMS standard protocol parsing/output.
+// 0 = Legacy-only (no !PMS parsing/output).
+#ifndef PMS_STD_ENABLED
+#define PMS_STD_ENABLED 1
+#endif
+
+// 1 = Keep legacy/debug Serial prints (CLI help, verbose logs).
+// 0 = Suppress all non-!PMS Serial prints (clean PMS serial output).
+#ifndef PMS_DEBUG_SERIAL
+#define PMS_DEBUG_SERIAL 1
+#endif
+
+#ifndef PMS_STATUS_PERIOD_MS
+#define PMS_STATUS_PERIOD_MS 250
+#endif
+
+#if PMS_STD_ENABLED
+// End reason hint used for !PMS game_end reporting (set by STOP/TIMEUP/NO_LIVES code paths)
+static const char* s_pmsEndReasonHint = nullptr; // "stopped"|"timeup"|"no_lives"
+#endif
+
+#if PMS_DEBUG_SERIAL
+  // Variadic macros allow DBG_PRINTLN() with no args
+  #define DBG_PRINT(...)    Serial.print(__VA_ARGS__)
+  #define DBG_PRINTLN(...)  Serial.println(__VA_ARGS__)
+  #define DBG_PRINTF(...)   Serial.printf(__VA_ARGS__)
+#else
+  #define DBG_PRINT(...)    do { } while (0)
+  #define DBG_PRINTLN(...)  do { } while (0)
+  #define DBG_PRINTF(...)   do { } while (0)
+#endif
+
+// Best-effort suppression of logging macros (if present) to keep serial output clean.
+#if !PMS_DEBUG_SERIAL
+  #ifdef PZ_LOGI
+    #undef PZ_LOGI
+    #define PZ_LOGI(...) do { } while (0)
+  #endif
+  #ifdef PZ_LOGW
+    #undef PZ_LOGW
+    #define PZ_LOGW(...) do { } while (0)
+  #endif
+  #ifdef PZ_LOGE
+    #undef PZ_LOGE
+    #define PZ_LOGE(...) do { } while (0)
+  #endif
+#endif
 
 static uint16_t g_seq = 1;
 static Preferences s_prefsBoxes;
@@ -144,6 +227,11 @@ struct OrdersDrip {
 };
 static OrdersDrip s_ordersDrip = {false,0,0,0,0};
 
+// --- HOUSE MAPPING resend burst ---
+// Level transitions require pushing new house identities (window/panel/sound).
+// ESPNOW is lossy, so we resend the mapping a few times to ensure every house updates.
+// HouseNode/HousePanel treat identical mapping as a no-op (dedupe), so resends are safe.
+
 // --- GAME_STATE broadcaster (Central -> ALL) ---
 // Player-interactive stations (HOUSE_NODE / ORDERS_NODE / PIZZA_NODE) should hard-disable inputs
 // unless phase == Running.
@@ -208,7 +296,7 @@ static void gamePrintStatus(){
   uint8_t lvl = g_engine.level();
   uint16_t q  = quotaForLevel(lvl);
 
-  Serial.printf("game: phase=%s level=%u lives=%u/%u okLevel=%u/%u okTotal=%u timeLeft=%ldms\n",
+  DBG_PRINTF("game: phase=%s level=%u lives=%u/%u okLevel=%u/%u okTotal=%u timeLeft=%ldms\n",
     (running ? "RUNNING" : (g_game.phase==GP_IDLE ? "IDLE" : "OVER")),
     (unsigned)lvl,
     (unsigned)g_engine.livesLeft(), (unsigned)g_engine.livesMax(),
@@ -255,6 +343,9 @@ static void gameStart(uint16_t minutes, uint8_t level){
   if (level > 5) level = 5;
   g_engine.startGameAtLevel((uint8_t)level, now);
 
+  // Resend mapping a couple of times right after game start (covers occasional packet loss)
+  requestGameStateBurst(6);
+
   // Broadcast first order window (OrdersStation will start countdown from remain_s)
   ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
 
@@ -263,7 +354,7 @@ static void gameStart(uint16_t minutes, uint8_t level){
 
   g_gameTickDueAt = now + 100;
 
-  Serial.println("game: START");
+  DBG_PRINTLN("game: START");
   gamePrintStatus();
 }
 
@@ -313,7 +404,7 @@ static void gameOverFxTick() {
     s_goFx.active = false;
     g_game.phase = GP_IDLE;
     requestGameStateBurst(6);
-    Serial.println("game: OVER -> IDLE");
+    DBG_PRINTLN("game: OVER -> IDLE");
     gamePrintStatus();
   } else {
     s_goFx.nextAt = now + 160;
@@ -342,14 +433,14 @@ static void gameStop(){
   // Also clear remembered toppings at game end
   ingredientsResetAll();
 
-  Serial.println("game: STOP");
+  DBG_PRINTLN("game: STOP");
   gamePrintStatus();
 }
 
 static void gameNextLevel(){
   // NOTE: With PizzaGameEngine, levels advance automatically based on per-level quotas.
   // Keeping this CLI hook as a debug affordance; for now it just prints state.
-  Serial.println("game next: (engine) levels auto-advance; use deliveries to progress");
+  DBG_PRINTLN("game next: (engine) levels auto-advance; use deliveries to progress");
   gamePrintStatus();
 }
 
@@ -373,13 +464,25 @@ static void gameTick(){
 
   // Global run cap
   if ((int32_t)(now - g_game.endsAt) >= 0) {
-    Serial.println("game: TIME UP");
+    DBG_PRINTLN("game: TIME UP");
+    #if PMS_STD_ENABLED
+    s_pmsEndReasonHint = "timeup";
+    #endif
     gameStop();
     return;
   }
 
   // Engine tick (handles per-order expiry + refills + auto level-up)
+  const uint8_t levelBefore = g_engine.level();
   const bool changed = g_engine.tick(now);
+  const uint8_t levelAfter  = g_engine.level();
+
+  // If the engine advanced to a new level, resend mapping a few times.
+  // (If a house misses this, it will still show the previous level identity and orders will look "wrong".)
+  if (levelAfter != levelBefore) {
+    DBG_PRINTF("[central] LEVEL CHANGE %u -> %u\n", (unsigned)levelBefore, (unsigned)levelAfter);
+    requestGameStateBurst(6);
+  }
 
   // If orders changed (expiry/refill/level-up), push window to OrdersStation
   if (changed) {
@@ -388,7 +491,10 @@ static void gameTick(){
 
   // Engine might end the game (out of lives, completed final level)
   if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
-    Serial.println("game: ENGINE END");
+    DBG_PRINTLN("game: ENGINE END");
+    #if PMS_STD_ENABLED
+    s_pmsEndReasonHint = (g_engine.livesLeft() == 0) ? "no_lives" : "timeup";
+    #endif
     gameStop();
   }
 }
@@ -402,7 +508,7 @@ static void ordersPushWindowDripStart(uint8_t maxDisplay, uint16_t startDelayMs)
   s_ordersDrip.idx    = 0;
   s_ordersDrip.stage  = 0;                       // send RESET first
   s_ordersDrip.dueAt  = millis() + startDelayMs; // small pause after verdicts
-  Serial.printf("[central] DRIP start: window=%u delay=%ums\n", win, (unsigned)startDelayMs);
+  DBG_PRINTF("[central] DRIP start: window=%u delay=%ums\n", win, (unsigned)startDelayMs);
 }
 
 static void ordersPushWindowDripTick() {
@@ -420,7 +526,7 @@ static void ordersPushWindowDripTick() {
   // Done?
   if (s_ordersDrip.idx >= s_ordersDrip.window) {
     s_ordersDrip.active = false;
-    Serial.println("[central] DRIP done");
+    DBG_PRINTLN("[central] DRIP done");
     return;
   }
 
@@ -466,18 +572,18 @@ static void ordersAssignNumbers(uint32_t seed) {
     g_housePool[h] = base + i;
   }
 
-  Serial.printf("orders: pool ->");
-  for (int h=1; h<=6; ++h) Serial.printf(" H%d=#%u", h, g_housePool[h]);
-  Serial.println();
+  DBG_PRINTF("orders: pool ->");
+  for (int h=1; h<=6; ++h) DBG_PRINTF(" H%d=#%u", h, g_housePool[h]);
+  DBG_PRINTLN();
 }
 
 static void ordersShowPool() {
-  if (!g_housePool[1]) { Serial.println("orders: pool is empty (run `orders pool reset`)"); return; }
-  Serial.printf("orders: pool ->"); for (int h=1; h<=6; ++h) Serial.printf(" H%d=#%u", h, g_housePool[h]); Serial.println();
+  if (!g_housePool[1]) { DBG_PRINTLN("orders: pool is empty (run `orders pool reset`)"); return; }
+  DBG_PRINTF("orders: pool ->"); for (int h=1; h<=6; ++h) DBG_PRINTF(" H%d=#%u", h, g_housePool[h]); DBG_PRINTLN();
 }
 
 static void housesNumbersShow() {
-  if (!g_housePool[1]) { Serial.println("houses: pool empty; run `orders pool reset` first"); return; }
+  if (!g_housePool[1]) { DBG_PRINTLN("houses: pool empty; run `orders pool reset` first"); return; }
   for (uint8_t h=1; h<=6; ++h) {
     char digits[8]; snprintf(digits, sizeof(digits), "%u", (unsigned)g_housePool[h]);
     // Panel only (flags=0x02). NOTE: 5 window fields -> 0,0,0,0,0
@@ -486,7 +592,7 @@ static void housesNumbersShow() {
                      /*panel*/PANEL_MODE_NUMBER, digits, 1,1,180,
                      /*spk*/0,0,false,false);
   }
-  Serial.println("houses: numbers pushed to panels");
+  DBG_PRINTLN("houses: numbers pushed to panels");
 }
 
 // Add 1 Level-1 order to your local list (returns false if list is full)
@@ -501,7 +607,7 @@ static bool ordersGenLevel1() {
            kTopNames[topIdx], g_housePool[targetHouse]);
 
   bool ok = ordersAddLocal(targetHouse, mask, clue);
-  if (ok) Serial.printf("orders: gen1 -> H%u mask=0x%02X text=\"%s\"\n", targetHouse, mask, clue);
+  if (ok) DBG_PRINTF("orders: gen1 -> H%u mask=0x%02X text=\"%s\"\n", targetHouse, mask, clue);
   return ok;
 }
 
@@ -639,19 +745,19 @@ static void ingredientsResetAll() {
   }
   // Wipe our cache
   g_tagCount = 0;
-  Serial.println("[central] ingredients: reset all (cache cleared and snapshots broadcast)");
+  DBG_PRINTLN("[central] ingredients: reset all (cache cleared and snapshots broadcast)");
 }
 
 static void printMask(uint8_t m) {
-  if (m == MASK_NONE) { Serial.print(F("(none)")); return; }
-  Serial.print(F("0x")); if (m < 16) Serial.print('0'); Serial.print(m, HEX);
-  Serial.print(F(" ["));
-  Serial.print((m &  1) ? 'P' : '.'); // Pepperoni
-  Serial.print((m &  2) ? 'M' : '.'); // Mushrooms
-  Serial.print((m &  4) ? 'p' : '.'); // Peppers
-  Serial.print((m &  8) ? 'i' : '.'); // Pineapple
-  Serial.print((m & 16) ? 'H' : '.'); // Ham
-  Serial.print(']');
+  if (m == MASK_NONE) { DBG_PRINT(F("(none)")); return; }
+  DBG_PRINT(F("0x")); if (m < 16) DBG_PRINT('0'); DBG_PRINT(m, HEX);
+  DBG_PRINT(F(" ["));
+  DBG_PRINT((m &  1) ? 'P' : '.'); // Pepperoni
+  DBG_PRINT((m &  2) ? 'M' : '.'); // Mushrooms
+  DBG_PRINT((m &  4) ? 'p' : '.'); // Peppers
+  DBG_PRINT((m &  8) ? 'i' : '.'); // Pineapple
+  DBG_PRINT((m & 16) ? 'H' : '.'); // Ham
+  DBG_PRINT(']');
 }
 
 // Handy printer
@@ -661,7 +767,7 @@ static void factsShow(){
   auto hs=[](uint8_t s){ return (s==HS_ROUND?"round":"bar"); };
   auto hk=[](uint8_t c){ return (c==HCOL_SILVER?"silver":"gold"); };
   for (uint8_t h=1; h<=6; ++h){
-    Serial.printf("H%u: house=%s door=%s handle=%s/%s beside={%u%s%s} across=%u\n",
+    DBG_PRINTF("H%u: house=%s door=%s handle=%s/%s beside={%u%s%s} across=%u\n",
       h, hc(g_fact_houseColor[h]), dc(g_fact_doorColor[h]),
       hs(g_fact_handleShape[h]), hk(g_fact_handleColor[h]),
       g_besideA[h], (g_besideB[h]? ",":""),
@@ -681,12 +787,12 @@ static bool isWhitelisted(const uint8_t* uid, uint8_t len){
 }
 
 static void boxesShow(){
-  Serial.println("boxes:");
+  DBG_PRINTLN("boxes:");
   for (int i=0;i<6;i++){
-    Serial.printf("  %d: ", i+1);
-    if (!g_box[i].set) { Serial.println("(empty)"); continue; }
-    for (uint8_t k=0;k<g_box[i].len;k++){ if (g_box[i].uid[k]<16) Serial.print('0'); Serial.print(g_box[i].uid[k], HEX); if (k+1<g_box[i].len) Serial.print(':'); }
-    Serial.println();
+    DBG_PRINTF("  %d: ", i+1);
+    if (!g_box[i].set) { DBG_PRINTLN("(empty)"); continue; }
+    for (uint8_t k=0;k<g_box[i].len;k++){ if (g_box[i].uid[k]<16) DBG_PRINT('0'); DBG_PRINT(g_box[i].uid[k], HEX); if (k+1<g_box[i].len) DBG_PRINT(':'); }
+    DBG_PRINTLN();
   }
 }
 
@@ -726,7 +832,7 @@ static void boxesSave(){
   s_prefsBoxes.begin("central", false);   // NVS namespace for Central
   s_prefsBoxes.putBytes("boxes", a, sizeof(a));
   s_prefsBoxes.end();
-  Serial.println("boxes: saved to NVS");
+  DBG_PRINTLN("boxes: saved to NVS");
 }
 
 static void boxesLoad(){
@@ -742,11 +848,11 @@ static void boxesLoad(){
       if (g_box[i].len > 10) g_box[i].len = 0;
       if (g_box[i].len) memcpy(g_box[i].uid, a[i].uid, g_box[i].len);
     }
-    Serial.println("boxes: loaded from NVS");
+    DBG_PRINTLN("boxes: loaded from NVS");
   } else {
     // Nothing stored yet → leave empty
     for (int i=0;i<6;i++){ g_box[i].set=false; g_box[i].len=0; }
-    Serial.println("boxes: NVS empty");
+    DBG_PRINTLN("boxes: NVS empty");
   }
 }
 
@@ -798,7 +904,7 @@ static void rosterUpdateFromHello(const MsgHeader& hdr, const HelloPayload* h, c
 }
 
 static void rosterPrint() {
-  Serial.println(F("\nROLE          ID   FW        MAC                LAST_SEEN(ms)\n--------------------------------------------------------------"));
+  DBG_PRINTLN(F("\nROLE          ID   FW        MAC                LAST_SEEN(ms)\n--------------------------------------------------------------"));
   for (int i=0;i<MAX_DEVICES;i++) if (g_devices[i].used) {
     char macbuf[18]; macToStr(g_devices[i].mac, macbuf);
     const char* rn = "UNKNOWN";
@@ -812,11 +918,11 @@ static void rosterPrint() {
     }
     uint32_t last = g_devices[i].last_seen_ms;
     uint32_t age  = millis() - last;
-    Serial.printf("%-12s  %2u   %-8s  %-17s  %9u  %7us\n",
+    DBG_PRINTF("%-12s  %2u   %-8s  %-17s  %9u  %7us\n",
       rn, g_devices[i].house_id, g_devices[i].fw, macbuf,
       (unsigned)last, (unsigned)(age/1000));
   }
-  Serial.println();
+  DBG_PRINTLN();
 }
 
 static void rosterTouch(const uint8_t mac[6], uint8_t role, uint8_t house_id){
@@ -843,7 +949,7 @@ static void sendNetCfgSet(const char* ssid, const char* pass, const char* base) 
   uint8_t buf[256];
   size_t n = PizzaProtocol::pack(NET_CFG_SET, CENTRAL, 0, g_seq++, &p, sizeof(p), buf, sizeof(buf));
   PizzaNow::sendBroadcast(buf, n);
-  Serial.printf("[Central] NET_CFG_SET -> ssid=\"%s\" base=\"%s\"\n", p.ssid, p.base);
+  DBG_PRINTF("[Central] NET_CFG_SET -> ssid=\"%s\" base=\"%s\"\n", p.ssid, p.base);
 }
 
 static void sendPanelText(uint8_t houseId, const String& text, uint8_t style, uint8_t speed, uint8_t bright) {
@@ -888,14 +994,14 @@ static void ordersSendReset(uint8_t count) {
   uint8_t buf[64];
   size_t n = PizzaProtocol::pack(ORDER_LIST_RESET, CENTRAL, 0, g_seq_orders++, &p, sizeof(p), buf, sizeof(buf));
   PizzaNow::sendBroadcast(buf, n);
-  Serial.printf("[Central] ORDER_LIST_RESET count=%u\n", count);
+  DBG_PRINTF("[Central] ORDER_LIST_RESET count=%u\n", count);
 }
 
 static void ordersSendItem(const PzOrderItemSetPayload& item) {
   uint8_t buf[256];
   size_t n = PizzaProtocol::pack(ORDER_ITEM_SET, CENTRAL, 0, g_seq_orders++, &item, sizeof(item), buf, sizeof(buf));
   PizzaNow::sendBroadcast(buf, n);
-  Serial.printf("[Central] ORDER_ITEM_SET idx=%u H%u mask=0x%02X\n", item.index, item.house_id, item.mask);
+  DBG_PRINTF("[Central] ORDER_ITEM_SET idx=%u H%u mask=0x%02X\n", item.index, item.house_id, item.mask);
 }
 
 /*** CENTRAL: push local list to the Orders Node(s) ***/
@@ -927,7 +1033,7 @@ static void ordersPushWindow(uint8_t maxDisplay) {
     ordersSendItem(it);
     delay(6);
   }
-  Serial.printf("[Central] Pushed window=%u of total=%u\n", window, g_orderCount);
+  DBG_PRINTF("[Central] Pushed window=%u of total=%u\n", window, g_orderCount);
 }
 
 /*** CENTRAL: send ORDER_SHOW_TEXT directly to the panel ***/
@@ -939,7 +1045,7 @@ static void ordersSendShowText(const char* s) {
   uint8_t buf[256];
   size_t n = PizzaProtocol::pack(ORDER_SHOW_TEXT, CENTRAL, 0, g_seq_orders++, &p, sizeof(p), buf, sizeof(buf));
   PizzaNow::sendBroadcast(buf, n);
-  Serial.printf("[Central] ORDER_SHOW_TEXT len=%u\n", (unsigned)strlen(p.text));
+  DBG_PRINTF("[Central] ORDER_SHOW_TEXT len=%u\n", (unsigned)strlen(p.text));
 }
 
 // === CENTRAL: apply the pushed orders to the delivery validator ===
@@ -956,7 +1062,7 @@ static void ordersApplyToValidator() {
       g_orderMask[it.house_id] = it.mask;
     }
   }
-  Serial.println(F("[central] ordersApplyToValidator: validator masks updated"));
+  DBG_PRINTLN(F("[central] ordersApplyToValidator: validator masks updated"));
 }
 
 static void sendHouseDigital(
@@ -1041,10 +1147,10 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
   if (hdr.type == PIZZA_ING_UPDATE && len >= sizeof(PizzaIngrUpdatePayload)) {
     const PizzaIngrUpdatePayload* u = (const PizzaIngrUpdatePayload*)payload;
     if (!isWhitelisted(u->uid, u->uid_len)) {
-      Serial.println("[Central] ING_UPDATE ignored: UID not whitelisted");
+      DBG_PRINTLN("[Central] ING_UPDATE ignored: UID not whitelisted");
       return;
     }
-    Serial.printf("[Central] ING_UPDATE from id=%u mask=0x%02X\n", hdr.house_id, u->mask);
+    DBG_PRINTF("[Central] ING_UPDATE from id=%u mask=0x%02X\n", hdr.house_id, u->mask);
     // Remember uid->mask for validation later
     tagUpsert(u->uid, u->uid_len, u->mask);
     return;
@@ -1066,9 +1172,9 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
       g_box[g_learnSlot-1].len = s->uid_len;
       memcpy(g_box[g_learnSlot-1].uid, s->uid, s->uid_len);
       g_box[g_learnSlot-1].set = true;
-      Serial.printf("boxes: learned slot %d -> ", g_learnSlot);
-      for (uint8_t k=0;k<s->uid_len;k++){ if (s->uid[k]<16) Serial.print('0'); Serial.print(s->uid[k], HEX); if (k+1<s->uid_len) Serial.print(':'); }
-      Serial.println();
+      DBG_PRINTF("boxes: learned slot %d -> ", g_learnSlot);
+      for (uint8_t k=0;k<s->uid_len;k++){ if (s->uid[k]<16) DBG_PRINT('0'); DBG_PRINT(s->uid[k], HEX); if (k+1<s->uid_len) DBG_PRINT(':'); }
+      DBG_PRINTLN();
       g_learnSlot = 0;
       boxesSave();
       // continue to normal validation
@@ -1124,6 +1230,9 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
         }
         // If that delivery completed the game (final level), stop cleanly
         if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
+          #if PMS_STD_ENABLED
+          s_pmsEndReasonHint = (g_engine.livesLeft() == 0) ? "no_lives" : "timeup";
+          #endif
           gameStop();
         }
       }
@@ -1135,6 +1244,9 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
         ordersPushWindowDripStart(/*maxDisplay*/3, ORD_DRIP_START_DELAY_MS);
       }
       if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
+        #if PMS_STD_ENABLED
+        s_pmsEndReasonHint = (g_engine.livesLeft() == 0) ? "no_lives" : "timeup";
+        #endif
         gameStop();
       }
     }
@@ -1160,7 +1272,7 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 
   if (hdr.type == ASSET_RESULT && len >= sizeof(AssetResultPayload)) {
     const AssetResultPayload* r = (const AssetResultPayload*)payload;
-    Serial.printf("[Central] ASSET_RESULT H%u ok=%u count=%u code=%u\n",
+    DBG_PRINTF("[Central] ASSET_RESULT H%u ok=%u count=%u code=%u\n",
                   r->house_id, r->ok, r->count_done, r->code);
     return;
   }
@@ -1191,100 +1303,330 @@ static String readLine() {
 
 static int parseInt(const String& s, int def=0){ char* e=nullptr; long v=strtol(s.c_str(), &e, 10); return (e && *e==0)? (int)v : def; }
 
+// -------------------- PMS STANDARD SERIAL (v1) --------------------
+#if PMS_STD_ENABLED
+
+// PMS state tracking for delta/events
+static uint32_t s_pmsLastTickMs = 0;
+static bool     s_pmsBaselineValid = false;
+static bool     s_pmsWasRunning = false;
+static uint8_t  s_pmsLastLevel = 1;
+static uint16_t s_pmsLastScore = 0;
+static uint8_t  s_pmsLastLives = 0;
+
+// NOTE: Pizza currently has no explicit "arming" phase; we report state=playing while running.
+static const char* pmsStateStr(bool running) {
+  return running ? "playing" : "idle";
+}
+
+static const char* pmsLastReasonStr(bool stateChanged, int32_t scoreDelta, int32_t livesDelta) {
+  if (livesDelta < 0) return "life";
+  if (scoreDelta > 0) return "score";
+  if (stateChanged)   return "state";
+  return "none";
+}
+
+static void pmsPrintPong() {
+  Serial.println(F("!PMS PONG v=1 game=pizza role=server"));
+}
+
+static void pmsPrintEventGameStart(uint8_t level) {
+  Serial.print(F("!PMS EVENT v=1 name=game_start level="));
+  Serial.println(level);
+}
+
+static void pmsPrintEventGameEnd(const char* reason, uint16_t score, uint8_t lives) {
+  Serial.print(F("!PMS EVENT v=1 name=game_end reason="));
+  Serial.print(reason);
+  Serial.print(F(" score="));
+  Serial.print(score);
+  Serial.print(F(" lives="));
+  Serial.println(lives);
+}
+
+static void pmsPrintEventScore(int32_t delta, uint16_t total) {
+  Serial.print(F("!PMS EVENT v=1 name=score delta="));
+  Serial.print(delta);
+  Serial.print(F(" total="));
+  Serial.print(total);
+  Serial.println(F(" bonus=0"));
+}
+
+static void pmsPrintEventLife(int32_t delta, uint8_t lives) {
+  Serial.print(F("!PMS EVENT v=1 name=life delta="));
+  Serial.print(delta);
+  Serial.print(F(" lives="));
+  Serial.println(lives);
+}
+
+static void pmsPrintStatus(const char* state, uint8_t level, uint16_t score, uint8_t lives, uint32_t tleftMs, const char* lastReason) {
+  Serial.print(F("!PMS STATUS v=1 state="));
+  Serial.print(state);
+  Serial.print(F(" level="));
+  Serial.print(level);
+  Serial.print(F(" score="));
+  Serial.print(score);
+  Serial.print(F(" lives="));
+  Serial.print(lives);
+  Serial.print(F(" tleft_ms="));
+  Serial.print(tleftMs);
+  Serial.print(F(" last_reason="));
+  Serial.println(lastReason);
+}
+
+// Simple key=value int parser from a command line (e.g. "START level=2")
+static int32_t pmsParseKeyInt(const String& s, const char* key, int32_t defVal) {
+  String pat = String(key) + "=";
+  int idx = s.indexOf(pat);
+  if (idx < 0) return defVal;
+  idx += pat.length();
+  int end = idx;
+  while (end < (int)s.length()) {
+    char c = s.charAt(end);
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') break;
+    end++;
+  }
+  String v = s.substring(idx, end);
+  v.trim();
+  if (!v.length()) return defVal;
+  return v.toInt();
+}
+
+// PMS command handler:
+//   !PMS PING
+//   !PMS START level=1
+//   !PMS STOP
+static bool handlePmsLine(const String& rawLine) {
+  String line = rawLine;
+  line.trim();
+  if (!line.startsWith("!PMS")) return false;
+
+  // Strip prefix
+  String rest = line.substring(4);
+  rest.trim();
+  if (!rest.length()) return true;
+
+  // KIND token
+  int sp = rest.indexOf(' ');
+  String kind = (sp >= 0) ? rest.substring(0, sp) : rest;
+  String args = (sp >= 0) ? rest.substring(sp + 1) : "";
+  kind.toUpperCase();
+  args.trim();
+
+  if (kind == "PING") {
+    pmsPrintPong();
+    return true;
+  }
+
+  if (kind == "START") {
+    int lvl = (int)pmsParseKeyInt(args, "level", 1);
+    if (lvl < 1) lvl = 1;
+    if (lvl > 5) lvl = 5;
+
+    // Starting a run clears any previous stop reason hint
+    s_pmsEndReasonHint = nullptr;
+
+    // Start with default minutes (0 -> use configured default)
+    gameStart(0, (uint8_t)lvl);
+    return true;
+  }
+
+  if (kind == "STOP") {
+    // Hint end reason for PMS (used when we detect the transition)
+    s_pmsEndReasonHint = "stopped";
+    gameStop();
+    return true;
+  }
+
+  // Unknown PMS command: ignore silently
+  return true;
+}
+
+// Emit STATUS + derived EVENTS at 250ms cadence while running.
+// STATUS is NOT emitted while idle.
+static void pmsTick() {
+  const uint32_t now = millis();
+  if ((uint32_t)(now - s_pmsLastTickMs) < (uint32_t)PMS_STATUS_PERIOD_MS) return;
+  s_pmsLastTickMs = now;
+
+  const bool running = (g_game.phase == GP_RUNNING) && (g_engine.phase() == PizzaGameEngine::Phase::Running);
+
+  const uint8_t  curLevel = running ? g_engine.level() : 1;
+  const uint16_t curScore = running ? (uint16_t)g_engine.successTotal() : 0;
+  const uint8_t  curLives = running ? g_engine.livesLeft() : (uint8_t)g_engine.livesMax();
+
+  uint32_t tleftMs = 0;
+  if (running) {
+    int32_t rem = (int32_t)(g_game.endsAt - now);
+    if (rem < 0) rem = 0;
+    tleftMs = (uint32_t)rem;
+  }
+
+  if (!s_pmsBaselineValid) {
+    s_pmsBaselineValid = true;
+    s_pmsWasRunning = running;
+    s_pmsLastLevel = curLevel;
+    s_pmsLastScore = curScore;
+    s_pmsLastLives = curLives;
+
+    // Do not emit events on first tick.
+    if (running) {
+      pmsPrintStatus(pmsStateStr(true), curLevel, curScore, curLives, tleftMs, "none");
+    }
+    return;
+  }
+
+  // Detect transitions
+  bool stateChanged = (running != s_pmsWasRunning);
+  int32_t scoreDelta = (int32_t)curScore - (int32_t)s_pmsLastScore;
+  int32_t livesDelta = (int32_t)curLives - (int32_t)s_pmsLastLives;
+
+  // Transition -> events
+  if (stateChanged) {
+    if (!s_pmsWasRunning && running) {
+      pmsPrintEventGameStart(curLevel);
+    } else if (s_pmsWasRunning && !running) {
+      const char* reason = s_pmsEndReasonHint;
+      if (!reason) {
+        // Best-effort fallback
+        if (s_pmsLastLives == 0) reason = "no_lives";
+        else if ((int32_t)(now - g_game.endsAt) >= 0) reason = "timeup";
+        else reason = "stopped";
+      }
+      pmsPrintEventGameEnd(reason, s_pmsLastScore, s_pmsLastLives);
+      s_pmsEndReasonHint = nullptr;
+    }
+  }
+
+  // Ongoing run -> score/life events
+  if (running && s_pmsWasRunning) {
+    if (scoreDelta > 0) {
+      pmsPrintEventScore(scoreDelta, curScore);
+    }
+    if (livesDelta < 0) {
+      pmsPrintEventLife(livesDelta, curLives);
+    }
+  }
+
+  // STATUS only while running
+  if (running) {
+    const char* lastReason = pmsLastReasonStr(stateChanged, scoreDelta, livesDelta);
+    pmsPrintStatus(pmsStateStr(true), curLevel, curScore, curLives, tleftMs, lastReason);
+  }
+
+  // Update baseline
+  s_pmsWasRunning = running;
+  if (running) {
+    s_pmsLastLevel = curLevel;
+    s_pmsLastScore = curScore;
+    s_pmsLastLives = curLives;
+  } else {
+    // reset stored values so next run doesn't emit spurious deltas
+    s_pmsLastLevel = 1;
+    s_pmsLastScore = 0;
+    s_pmsLastLives = (uint8_t)g_engine.livesMax();
+  }
+}
+
+#else
+static void pmsTick() { }
+static bool handlePmsLine(const String&) { return false; }
+#endif
+
 /*** Central CLI: help printer ***/
 static void printHelp() {
-  Serial.println(F("=== Central CLI Help ==="));
-  Serial.println();
+  DBG_PRINTLN(F("=== Central CLI Help ==="));
+  DBG_PRINTLN();
 
   // General
-  Serial.println(F("General"));
-  Serial.println(F("  help | ?                       Show this help"));
-  Serial.println(F("  list                           Print device roster"));
-  Serial.println(F("  hello-req                      Ask nodes to send HELLO"));
-  Serial.println();
+  DBG_PRINTLN(F("General"));
+  DBG_PRINTLN(F("  help | ?                       Show this help"));
+  DBG_PRINTLN(F("  list                           Print device roster"));
+  DBG_PRINTLN(F("  hello-req                      Ask nodes to send HELLO"));
+  DBG_PRINTLN();
 
   // Boxes (pizza box UID management)
-  Serial.println(F("Boxes (pizza box UID management)"));
-  Serial.println(F("  boxes show                     Show current 1..6 box UID slots"));
-  Serial.println(F("  boxes clear [n]                Clear all or slot n (1..6)"));
-  Serial.println(F("  boxes set <n> <UIDhex>         Set slot n with UID (colons ok)"));
-  Serial.println(F("  boxes learn <n>                Learn next scanned tag into slot n"));
-  Serial.println(F("  boxes reload                   Reload from NVS and show"));
-  Serial.println();
+  DBG_PRINTLN(F("Boxes (pizza box UID management)"));
+  DBG_PRINTLN(F("  boxes show                     Show current 1..6 box UID slots"));
+  DBG_PRINTLN(F("  boxes clear [n]                Clear all or slot n (1..6)"));
+  DBG_PRINTLN(F("  boxes set <n> <UIDhex>         Set slot n with UID (colons ok)"));
+  DBG_PRINTLN(F("  boxes learn <n>                Learn next scanned tag into slot n"));
+  DBG_PRINTLN(F("  boxes reload                   Reload from NVS and show"));
+  DBG_PRINTLN();
 
   // Facts
-  Serial.println(F("Facts"));
-  Serial.println(F("  facts show                     Print internal constants/config"));
-  Serial.println();
+  DBG_PRINTLN(F("Facts"));
+  DBG_PRINTLN(F("  facts show                     Print internal constants/config"));
+  DBG_PRINTLN();
 
   // Panels
-  Serial.println(F("Panels"));
-  Serial.println(F("  panel <id> \"text\" [style] [speed] [bright]"));
-  Serial.println(F("      style: 0=scroll, 1=static; speed: 1..5; bright: 0..255"));
-  Serial.println();
+  DBG_PRINTLN(F("Panels"));
+  DBG_PRINTLN(F("  panel <id> \"text\" [style] [speed] [bright]"));
+  DBG_PRINTLN(F("      style: 0=scroll, 1=static; speed: 1..5; bright: 0..255"));
+  DBG_PRINTLN();
 
   // Sound
-  Serial.println(F("Sound"));
-  Serial.println(F("  sound <id> [clip] [vol]        Play clip on house speaker (vol 0..255)"));
-  Serial.println();
+  DBG_PRINTLN(F("Sound"));
+  DBG_PRINTLN(F("  sound <id> [clip] [vol]        Play clip on house speaker (vol 0..255)"));
+  DBG_PRINTLN();
 
   // Scenes & Assets
-  Serial.println(F("Scenes & Assets"));
-  Serial.println(F("  scene <id> party|stop|number <digits>"));
-  Serial.println(F("  clips sync <id|all> <base_url> <count>"));
-  Serial.println();
+  DBG_PRINTLN(F("Scenes & Assets"));
+  DBG_PRINTLN(F("  scene <id> party|stop|number <digits>"));
+  DBG_PRINTLN(F("  clips sync <id|all> <base_url> <count>"));
+  DBG_PRINTLN();
 
   // OTA / Updates
-  Serial.println(F("OTA / Updates"));
-  Serial.println(F("  update <ROLE> all|id=<n> [url]"));
-  Serial.println(F("      ROLE: HOUSE_PANEL | HOUSE_NODE | ORDERS_PANEL | ORDERS_NODE | PIZZA_NODE | CENTRAL"));
-  Serial.println();
+  DBG_PRINTLN(F("OTA / Updates"));
+  DBG_PRINTLN(F("  update <ROLE> all|id=<n> [url]"));
+  DBG_PRINTLN(F("      ROLE: HOUSE_PANEL | HOUSE_NODE | ORDERS_PANEL | ORDERS_NODE | PIZZA_NODE | CENTRAL"));
+  DBG_PRINTLN();
 
   // Claiming
-  Serial.println(F("Claiming"));
-  Serial.println(F("  claim <MAC> <id> [force]       ex: claim AA:BB:CC:DD:EE:FF 3"));
-  Serial.println();
+  DBG_PRINTLN(F("Claiming"));
+  DBG_PRINTLN(F("  claim <MAC> <id> [force]       ex: claim AA:BB:CC:DD:EE:FF 3"));
+  DBG_PRINTLN();
 
   // Game
-  Serial.println(F("Game"));
-  Serial.println(F("  game start [minutes] [level]   Start a timed run (level defaults to 1; use for testing)"));
-  Serial.println(F("  game stop                      End game and clear orders"));
-  Serial.println(F("  game status                    Print current game state"));
-  Serial.println(F("  game next                      Debug: print status (levels auto-advance)"));
-  Serial.println(F("  (levels auto-advance via engine quotas; no target/auto knobs in CLI yet)"));
+  DBG_PRINTLN(F("Game"));
+  DBG_PRINTLN(F("  game start [minutes] [level]   Start a timed run (level defaults to 1; use for testing)"));
+  DBG_PRINTLN(F("  game stop                      End game and clear orders"));
+  DBG_PRINTLN(F("  game status                    Print current game state"));
+  DBG_PRINTLN(F("  game next                      Debug: print status (levels auto-advance)"));
+  DBG_PRINTLN(F("  (levels auto-advance via engine quotas; no target/auto knobs in CLI yet)"));
   // (engine handles auto-advance)
 
-  Serial.println(F("  game minutes <n>               Set default run duration (minutes)"));
-  Serial.println();
+  DBG_PRINTLN(F("  game minutes <n>               Set default run duration (minutes)"));
+  DBG_PRINTLN();
 
   // Delivery Validator (per-house mask)
-  Serial.println(F("Delivery Validator (per-house mask)"));
-  Serial.println(F("  order <id> <mask>              Set validator mask (0..31 or 0xNN)"));
-  Serial.println(F("  order show [id]                Show validator(s)"));
-  Serial.println(F("  order clear <id>               Clear validator"));
-  Serial.println(F("  tags                           List recent tag->mask cache"));
-  Serial.println();
+  DBG_PRINTLN(F("Delivery Validator (per-house mask)"));
+  DBG_PRINTLN(F("  order <id> <mask>              Set validator mask (0..31 or 0xNN)"));
+  DBG_PRINTLN(F("  order show [id]                Show validator(s)"));
+  DBG_PRINTLN(F("  order clear <id>               Clear validator"));
+  DBG_PRINTLN(F("  tags                           List recent tag->mask cache"));
+  DBG_PRINTLN();
 
   // Operator Orders (Orders Node/Panel list)
-  Serial.println(F("Operator Orders (Orders Node/Panel list)"));
-  Serial.println(F("  orders reset                   Clear local list (max 6 items)"));
-  Serial.println(F("  orders add <house> <mask> \"text\""));
-  Serial.println(F("  orders show                    Print local list"));
-  Serial.println(F("  orders push                    Broadcast list to Orders Node (+apply)"));
-  Serial.println(F("  orders apply                   Apply current list to validators"));
-  Serial.println(F("  orders pool reset              Generate new 6-number house pool"));
-  Serial.println(F("  orders pool show               Show current house numbers"));
-  Serial.println(F("  orders gen1                    Auto-add one L1 order (with clue)"));
-  Serial.println(F("  orders showidx <n>             Display item n on Orders Panel"));
-  Serial.println(F("  orders show \"text\"            Display ad-hoc text on Orders Panel"));
-  Serial.println();
+  DBG_PRINTLN(F("Operator Orders (Orders Node/Panel list)"));
+  DBG_PRINTLN(F("  orders reset                   Clear local list (max 6 items)"));
+  DBG_PRINTLN(F("  orders add <house> <mask> \"text\""));
+  DBG_PRINTLN(F("  orders show                    Print local list"));
+  DBG_PRINTLN(F("  orders push                    Broadcast list to Orders Node (+apply)"));
+  DBG_PRINTLN(F("  orders apply                   Apply current list to validators"));
+  DBG_PRINTLN(F("  orders pool reset              Generate new 6-number house pool"));
+  DBG_PRINTLN(F("  orders pool show               Show current house numbers"));
+  DBG_PRINTLN(F("  orders gen1                    Auto-add one L1 order (with clue)"));
+  DBG_PRINTLN(F("  orders showidx <n>             Display item n on Orders Panel"));
+  DBG_PRINTLN(F("  orders show \"text\"            Display ad-hoc text on Orders Panel"));
+  DBG_PRINTLN();
 
   // Network
-  Serial.println(F("Network"));
-  Serial.println(F("  net show                      Show current SSID/PASS/BASE (central-side)"));
-  Serial.println(F("  net set \"ssid\" \"pass\" \"base\"  Update central-side values"));
-  Serial.println(F("  net push                      Broadcast SSID/PASS/BASE to all nodes"));
-  Serial.println();
+  DBG_PRINTLN(F("Network"));
+  DBG_PRINTLN(F("  net show                      Show current SSID/PASS/BASE (central-side)"));
+  DBG_PRINTLN(F("  net set \"ssid\" \"pass\" \"base\"  Update central-side values"));
+  DBG_PRINTLN(F("  net push                      Broadcast SSID/PASS/BASE to all nodes"));
+  DBG_PRINTLN();
 }
 
 void setup() {
@@ -1312,7 +1654,7 @@ void setup() {
   requestGameStateBurst(6);
 
   // Help
-  Serial.println(F("Type 'help' for commands."));
+  DBG_PRINTLN(F("Type 'help' for commands."));
 }
 
 void loop() {
@@ -1325,9 +1667,16 @@ void loop() {
   ordersPushWindowDripTick();
   gameStateTick();
 
+  pmsTick();
+
   String line = readLine();
   if (!line.length()) return;
   line.trim();
+
+#if PMS_STD_ENABLED
+  if (line.startsWith("!PMS")) { handlePmsLine(line); return; }
+#endif
+
 
   /*** Central CLI: help entrypoint ***/
   if (line == "help" || line == "?") { printHelp(); return; }
@@ -1416,7 +1765,7 @@ void loop() {
     int s1=line.indexOf(' '); if (s1<0) return;
     String rest=line.substring(s1+1); rest.trim();
     int s2=rest.indexOf(' ');
-    if (s2<0){ Serial.println(F("usage: claim <MAC> <id> [force]")); return; }
+    if (s2<0){ DBG_PRINTLN(F("usage: claim <MAC> <id> [force]")); return; }
     String macStr=rest.substring(0,s2);
     String rest2=rest.substring(s2+1); rest2.trim();
     int s3=rest2.indexOf(' ');
@@ -1425,7 +1774,7 @@ void loop() {
     bool force = (s3>=0) ? (rest2.substring(s3+1)=="force") : false;
 
     uint8_t mac[6];
-    if (!parseMac(macStr, mac) || id<=0) { Serial.println(F("usage: claim <MAC> <id> [force]")); return; }
+    if (!parseMac(macStr, mac) || id<=0) { DBG_PRINTLN(F("usage: claim <MAC> <id> [force]")); return; }
     sendClaim(mac, (uint8_t)id, force);
     return;
   }
@@ -1438,11 +1787,11 @@ void loop() {
       rest = rest.substring(4); rest.trim();
       if (rest.length()) {
         int id = rest.toInt();
-        if (id < 0 || id > 255) { Serial.println(F("usage: order show [id]")); return; }
-        Serial.print(F("order[")); Serial.print(id); Serial.print(F("]=")); printMask(g_orderMask[id]); Serial.println();
+        if (id < 0 || id > 255) { DBG_PRINTLN(F("usage: order show [id]")); return; }
+        DBG_PRINT(F("order[")); DBG_PRINT(id); DBG_PRINT(F("]=")); printMask(g_orderMask[id]); DBG_PRINTLN();
       } else {
         for (int i = 0; i < 256; ++i) if (g_orderMask[i] != MASK_NONE) {
-          Serial.print(F("order[")); Serial.print(i); Serial.print(F("]=")); printMask(g_orderMask[i]); Serial.println();
+          DBG_PRINT(F("order[")); DBG_PRINT(i); DBG_PRINT(F("]=")); printMask(g_orderMask[i]); DBG_PRINTLN();
         }
       }
       return;
@@ -1451,36 +1800,36 @@ void loop() {
     if (rest.startsWith("clear")) {
       rest = rest.substring(5); rest.trim();
       int id = rest.toInt();
-      if (id < 0 || id > 255) { Serial.println(F("usage: order clear <id>")); return; }
+      if (id < 0 || id > 255) { DBG_PRINTLN(F("usage: order clear <id>")); return; }
       g_orderMask[id] = MASK_NONE;
-      Serial.printf("order[%d] cleared\n", id);
+      DBG_PRINTF("order[%d] cleared\n", id);
       return;
     }
 
     // order <id> <mask>
     int space = rest.indexOf(' ');
-    if (space < 0) { Serial.println(F("usage: order <id> <mask>  (mask: 0..31 or 0xNN)")); return; }
+    if (space < 0) { DBG_PRINTLN(F("usage: order <id> <mask>  (mask: 0..31 or 0xNN)")); return; }
     int id = rest.substring(0, space).toInt();
     String mstr = rest.substring(space + 1); mstr.trim();
     long mask;
     if (mstr.startsWith("0x") || mstr.startsWith("0X")) mask = strtol(mstr.c_str(), nullptr, 16);
     else mask = mstr.toInt();
-    if (id < 0 || id > 255 || mask < 0 || mask > 31) { Serial.println(F("usage: order <id> <mask>")); return; }
+    if (id < 0 || id > 255 || mask < 0 || mask > 31) { DBG_PRINTLN(F("usage: order <id> <mask>")); return; }
     g_orderMask[id] = (uint8_t)mask;
-    Serial.print(F("order[")); Serial.print(id); Serial.print(F("]=")); printMask(g_orderMask[id]); Serial.println();
+    DBG_PRINT(F("order[")); DBG_PRINT(id); DBG_PRINT(F("]=")); printMask(g_orderMask[id]); DBG_PRINTLN();
     return;
   }
 
   if (line == "tags") {
-    Serial.printf("tags (%u)\n", g_tagCount);
+    DBG_PRINTF("tags (%u)\n", g_tagCount);
     for (uint8_t i = 0; i < g_tagCount; ++i) {
-      Serial.printf("#%u ", i);
+      DBG_PRINTF("#%u ", i);
       for (uint8_t k = 0; k < g_tags[i].len; ++k) {
-        if (g_tags[i].uid[k] < 16) Serial.print('0');
-        Serial.print(g_tags[i].uid[k], HEX);
-        if (k + 1 < g_tags[i].len) Serial.print(':');
+        if (g_tags[i].uid[k] < 16) DBG_PRINT('0');
+        DBG_PRINT(g_tags[i].uid[k], HEX);
+        if (k + 1 < g_tags[i].len) DBG_PRINT(':');
       }
-      Serial.print(F(" → ")); printMask(g_tags[i].mask); Serial.println();
+      DBG_PRINT(F(" → ")); printMask(g_tags[i].mask); DBG_PRINTLN();
     }
     return;
   }
@@ -1492,19 +1841,19 @@ void loop() {
     // New: number pool for houses (6 consecutive numbers 1..99)
     if (rest == "pool reset") {
       ordersAssignNumbers(esp_random());
-      Serial.println("orders: pool reset");
+      DBG_PRINTLN("orders: pool reset");
       housesNumbersShow();              // <— push digits to panels automatically
       return;
     }
     if (rest == "pool show")  { ordersShowPool(); return; }
 
     // Existing: reset/show/push
-    if (rest == "reset") { ordersResetLocal(); Serial.println("orders: reset"); return; }
+    if (rest == "reset") { ordersResetLocal(); DBG_PRINTLN("orders: reset"); return; }
 
     if (rest == "show") {
-      Serial.printf("orders: count=%u\n", g_orderCount);
+      DBG_PRINTF("orders: count=%u\n", g_orderCount);
       for (uint8_t i=0;i<g_orderCount;i++) {
-        Serial.printf("  [%u] H%u mask=0x%02X text=\"%s\"\n",
+        DBG_PRINTF("  [%u] H%u mask=0x%02X text=\"%s\"\n",
           i, g_orders[i].house_id, g_orders[i].mask, g_orders[i].text);
       }
       return;
@@ -1523,7 +1872,7 @@ void loop() {
 
     // New: auto-generate one Level-1 order and add to local list
     if (rest == "gen1") {
-      if (!ordersGenLevel1()) { Serial.println("orders: list full (max 6)"); return; }
+      if (!ordersGenLevel1()) { DBG_PRINTLN("orders: list full (max 6)"); return; }
 
       // Arm the per-house validator for this order
       const auto &it = g_orders[g_orderCount-1];
@@ -1535,7 +1884,7 @@ void loop() {
       // Optional: ensure panels are showing the numbers (safe to resend)
       housesNumbersShow();
 
-      Serial.printf("orders: armed H%u with mask=0x%02X; clue in list\n", it.house_id, it.mask);
+      DBG_PRINTF("orders: armed H%u with mask=0x%02X; clue in list\n", it.house_id, it.mask);
       return;
     }
 
@@ -1543,12 +1892,12 @@ void loop() {
     if (rest.startsWith("add ")) {
       rest = rest.substring(4);
       int sp = rest.indexOf(' ');
-      if (sp < 0) { Serial.println("usage: orders add <house_id> <mask> \"text\""); return; }
+      if (sp < 0) { DBG_PRINTLN("usage: orders add <house_id> <mask> \"text\""); return; }
       int house = rest.substring(0, sp).toInt();
 
       String rest2 = rest.substring(sp+1); rest2.trim();
       sp = rest2.indexOf(' ');
-      if (sp < 0) { Serial.println("usage: orders add <house_id> <mask> \"text\""); return; }
+      if (sp < 0) { DBG_PRINTLN("usage: orders add <house_id> <mask> \"text\""); return; }
 
       String maskStr = rest2.substring(0, sp);
       String textStr = rest2.substring(sp+1); textStr.trim();
@@ -1559,21 +1908,21 @@ void loop() {
       long mask = (maskStr.startsWith("0x")||maskStr.startsWith("0X")) ? strtol(maskStr.c_str(), nullptr, 16)
                                                                       : maskStr.toInt();
       if (house < 1 || house > 6 || mask < 0 || mask > 31) {
-        Serial.println("usage: orders add <house_id 1..6> <mask 0..31|0xNN> \"text\"");
+        DBG_PRINTLN("usage: orders add <house_id 1..6> <mask 0..31|0xNN> \"text\"");
         return;
       }
       if (!ordersAddLocal((uint8_t)house, (uint8_t)mask, textStr.c_str())) {
-        Serial.println("orders: list full (max 6)");
+        DBG_PRINTLN("orders: list full (max 6)");
         return;
       }
-      Serial.println("orders: added");
+      DBG_PRINTLN("orders: added");
       return;
     }
 
     // Existing: orders showidx <n>  -> send text of item n to panel
     if (rest.startsWith("showidx ")) {
       int n = rest.substring(8).toInt();
-      if (n < 0 || n >= g_orderCount) { Serial.println("usage: orders showidx <0..count-1>"); return; }
+      if (n < 0 || n >= g_orderCount) { DBG_PRINTLN("usage: orders showidx <0..count-1>"); return; }
       ordersSendShowText(g_orders[n].text);
       return;
     }
@@ -1591,11 +1940,11 @@ void loop() {
     if (rest.startsWith("auto ")) {
       String v = rest.substring(5); v.trim();
       g_autoNextL1 = (v == "on");
-      Serial.printf("orders auto-next L1 = %s\n", g_autoNextL1 ? "ON" : "OFF");
+      DBG_PRINTF("orders auto-next L1 = %s\n", g_autoNextL1 ? "ON" : "OFF");
       return;
     }
 
-    Serial.println("orders commands: reset | show | push | add <house> <mask> \"text\" | showidx <n> | show \"text\" | pool reset | pool show | gen1");
+    DBG_PRINTLN("orders commands: reset | show | push | add <house> <mask> \"text\" | showidx <n> | show \"text\" | pool reset | pool show | gen1");
     return;
   }
 
@@ -1636,7 +1985,7 @@ void loop() {
     // clips sync 3 http://10.0.0.5/pizza/h3 12
     String rest = line.substring(String("clips sync ").length()); rest.trim();
     int sp1 = rest.indexOf(' '), sp2 = rest.indexOf(' ', sp1+1);
-    if (sp1<0 || sp2<0) { Serial.println(F("usage: clips sync <id> <base_url> <count>")); return; }
+    if (sp1<0 || sp2<0) { DBG_PRINTLN(F("usage: clips sync <id> <base_url> <count>")); return; }
 
     int id = rest.substring(0,sp1).toInt();
     String base = rest.substring(sp1+1, sp2);
@@ -1647,7 +1996,7 @@ void loop() {
 
     uint8_t out[192]; size_t n = PizzaProtocol::pack(ASSET_SYNC, CENTRAL, 0, g_seq++, &ap, sizeof(ap), out, sizeof(out));
     PizzaNow::sendBroadcast(out, n);
-    Serial.printf("ASSET_SYNC -> id=%d url=%s count=%d\n", id, ap.base_url, ap.count);
+    DBG_PRINTF("ASSET_SYNC -> id=%d url=%s count=%d\n", id, ap.base_url, ap.count);
     return;
   }
 
@@ -1660,7 +2009,7 @@ void loop() {
     String rest = line.substring(11); rest.trim();
     int slot = rest.length()? rest.toInt() : 0;
     boxesClear(slot);
-    Serial.println("boxes: cleared");
+    DBG_PRINTLN("boxes: cleared");
     boxesSave();
     return;
   }
@@ -1669,14 +2018,14 @@ void loop() {
   if (line.startsWith("boxes set ")){
     String rest = line.substring(10); rest.trim();
     int sp = rest.indexOf(' ');
-    if (sp<0){ Serial.println("usage: boxes set <1..6> <UIDhex>"); return; }
+    if (sp<0){ DBG_PRINTLN("usage: boxes set <1..6> <UIDhex>"); return; }
     int slot = rest.substring(0,sp).toInt();
     String hex = rest.substring(sp+1); hex.trim();
-    if (slot<1||slot>6){ Serial.println("usage: boxes set <1..6> <UIDhex>"); return; }
+    if (slot<1||slot>6){ DBG_PRINTLN("usage: boxes set <1..6> <UIDhex>"); return; }
     uint8_t buf[10], len=0;
-    if (!parseUidHex(hex, buf, len)){ Serial.println("boxes set: bad UID"); return; }
+    if (!parseUidHex(hex, buf, len)){ DBG_PRINTLN("boxes set: bad UID"); return; }
     g_box[slot-1].set=true; g_box[slot-1].len=len; memcpy(g_box[slot-1].uid, buf, len);
-    Serial.printf("boxes: set slot %d\n", slot);
+    DBG_PRINTF("boxes: set slot %d\n", slot);
     boxesSave();
     return;
   }
@@ -1684,9 +2033,9 @@ void loop() {
   // boxes learn <n>   -> next scanned tag will populate slot n
   if (line.startsWith("boxes learn ")){
     int slot = line.substring(12).toInt();
-    if (slot<1||slot>6){ Serial.println("usage: boxes learn <1..6>"); return; }
+    if (slot<1||slot>6){ DBG_PRINTLN("usage: boxes learn <1..6>"); return; }
     g_learnSlot = slot;
-    Serial.printf("boxes: learning slot %d (scan a pizza box tag once)\n", slot);
+    DBG_PRINTF("boxes: learning slot %d (scan a pizza box tag once)\n", slot);
     return;
   }
 
@@ -1709,21 +2058,25 @@ void loop() {
     gameStart((uint16_t)minutes, (uint8_t)lvl);
     return;
   }
+  #if PMS_STD_ENABLED
+  if (line == "game stop"){ s_pmsEndReasonHint = "stopped"; gameStop(); return; }
+#else
   if (line == "game stop"){ gameStop(); return; }
+#endif
   if (line == "game status"){ gamePrintStatus(); return; }
   // game next  -> advance to next level (manual)
   if (line == "game next"){ gameNextLevel(); return; }
   // game target <n>  -> how many OKs to consider a level "complete"
-  if (line.startsWith("game target ")){ Serial.println("game target: handled by engine quotas (no-op)"); gamePrintStatus(); return; }
+  if (line.startsWith("game target ")){ DBG_PRINTLN("game target: handled by engine quotas (no-op)"); gamePrintStatus(); return; }
   // game auto on|off -> auto advance level when target reached
-  if (line.startsWith("game auto ")){ Serial.println("game auto: engine always auto-advances (no-op)"); gamePrintStatus(); return; }
+  if (line.startsWith("game auto ")){ DBG_PRINTLN("game auto: engine always auto-advances (no-op)"); gamePrintStatus(); return; }
   // game minutes <n> -> change duration for next start
   if (line.startsWith("game minutes ")){ int m=line.substring(13).toInt(); if (m>0) g_game.durationMs=(uint32_t)m*60UL*1000UL; return; }
   // net show
   if (line == "net show") {
-    Serial.printf("net: ssid=\"%s\"\n", g_net_ssid);
-    Serial.printf("net: pass=\"%s\"\n", g_net_pass);
-    Serial.printf("net: base=\"%s\"\n", g_net_base);
+    DBG_PRINTF("net: ssid=\"%s\"\n", g_net_ssid);
+    DBG_PRINTF("net: pass=\"%s\"\n", g_net_pass);
+    DBG_PRINTF("net: base=\"%s\"\n", g_net_base);
     return;
   }
 
@@ -1733,7 +2086,7 @@ void loop() {
     rest.trim();
 
     // Expect 3 quoted strings: "ssid" "pass" "base"
-    auto usage = [](){ Serial.println(F("usage: net set \"<ssid>\" \"<pass>\" \"<base_url>\"")); };
+    auto usage = [](){ DBG_PRINTLN(F("usage: net set \"<ssid>\" \"<pass>\" \"<base_url>\"")); };
 
     String s1, s2, s3;
 
@@ -1759,7 +2112,7 @@ void loop() {
     strlcpy(g_net_ssid, s1.c_str(), sizeof(g_net_ssid));
     strlcpy(g_net_pass, s2.c_str(), sizeof(g_net_pass));
     strlcpy(g_net_base, s3.c_str(), sizeof(g_net_base));
-    Serial.println(F("net: updated local values (use `net push` to broadcast)"));
+    DBG_PRINTLN(F("net: updated local values (use `net push` to broadcast)"));
     return;
   }
 

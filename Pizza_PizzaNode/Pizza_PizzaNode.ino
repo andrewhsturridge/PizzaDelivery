@@ -294,7 +294,14 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 
 // ---------------- Setup/Loop ----------------
 void setup() {
-  Serial.begin(115200); delay(100);
+  // IMPORTANT: Some NeoPixel rings retain their last displayed state across ESP32 resets.
+  // Turn the ring OFF as early as possible so it doesn't briefly appear white at boot.
+  pinMode(NEOPIXEL_PIN, OUTPUT);
+  digitalWrite(NEOPIXEL_PIN, LOW);
+  neoRingInit(); // sends a clear() + show()
+
+  Serial.begin(115200);
+  delay(50);
   PZ_LOGI("Pizza Node boot fw=%s mac=%s", PizzaIdentity::fw(), PizzaIdentity::macStr().c_str());
 
   // Lamps off
@@ -316,7 +323,6 @@ void setup() {
   PizzaNow::begin(ESPNOW_CHANNEL);
   PizzaNow::onReceive(onRx);
 
-  neoRingInit();
   PizzaOta::setProgressCallback(neoRingProgressDirectCB);
 
   sendHello();

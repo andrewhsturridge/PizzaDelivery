@@ -325,6 +325,26 @@ static void playResultBeep(bool ok, uint8_t vol) {
   }
 }
 
+// Generated beep-pattern identity clips (S2): /clips/100..105.wav
+// These can be harsh/loud at higher difficulty, so we scale them down in software.
+static inline bool isGeneratedBeepIdentity(uint8_t clipId) {
+  return (clipId >= 100 && clipId <= 105);
+}
+
+static uint8_t adjustedVolForClip(uint8_t clipId, uint8_t requestedVol) {
+  uint8_t v = requestedVol ? requestedVol : 10;
+
+  if (isGeneratedBeepIdentity(clipId)) {
+    // ~60% volume, clamped. At v=10 this becomes ~6.
+    uint16_t scaled = (uint16_t)v * 60 / 100;
+    if (scaled < 5)  scaled = 5;
+    if (scaled > 12) scaled = 12;
+    v = (uint8_t)scaled;
+  }
+
+  return v;
+}
+
 // Utility: tiny HSV→RGB for Adafruit_NeoPixel (0..255 each)
 static uint32_t hsv2rgb(uint8_t h, uint8_t s, uint8_t v){
   // simple wheel: map h(0..255) to 0..1530 steps
@@ -771,7 +791,9 @@ void loop() {
         g_beaconClip = 0;
         PizzaAudioFS::stop();
       } else {
-        PizzaAudioFS::setVolume(pendDigital.spk_vol);
+        // Scale volume for generated beep-pattern identities (100..105).
+        uint8_t v = adjustedVolForClip(pendDigital.spk_clip, pendDigital.spk_vol);
+        PizzaAudioFS::setVolume(v);
 
         // clip 0 means "silent"
         if (pendDigital.spk_clip == 0) {
@@ -782,7 +804,7 @@ void loop() {
           // Beacon mode: play briefly every few seconds (staggered per house)
           g_beaconEnabled = true;
           g_beaconClip = pendDigital.spk_clip;
-          g_beaconVol  = pendDigital.spk_vol;
+          g_beaconVol  = v;
 
           uint32_t now = millis();
           uint32_t jitter = (uint32_t)(esp_random() % 160); // 0..159ms
@@ -801,6 +823,7 @@ void loop() {
 
   if (doSound) {
     uint8_t vol = pendSound.vol ? pendSound.vol : 10;
+    vol = adjustedVolForClip(pendSound.clip_id, vol);
     PizzaAudioFS::setVolume(vol);
     if (!PizzaAudioFS::playClip(pendSound.clip_id, /*loop=*/false)) {
       Serial.printf("[House %u] SOUND_PLAY: missing /clips/%03u.wav\n", g_houseId, pendSound.clip_id);
