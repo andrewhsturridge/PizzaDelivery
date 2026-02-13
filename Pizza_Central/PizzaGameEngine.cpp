@@ -626,8 +626,14 @@ void PizzaGameEngine::buildMappingForLevel(uint8_t lvl) {
     // Windows: W1 all unique solids
     for (uint8_t h=1; h<=6; ++h) applyWinTok(h, kWinSolids[winIdx[h-1]]);
 
-    // Sound: S1 all unique
-    for (uint8_t h=1; h<=6; ++h) applySoundTok(h, kSoundS1[sndIdx[h-1]], 70);
+    // Level 1: NO sound identities (quiet intro round).
+    // Keep speakers silent so round 1 does not require audio mapping.
+    for (uint8_t h=1; h<=6; ++h) {
+      m_id[h].spkClip = 0;
+      m_id[h].spkVol  = 0;
+      m_id[h].spkLoop = false;
+      m_id[h].soundToken[0] = '\0';
+    }
     return;
   }
 
@@ -933,6 +939,18 @@ bool PizzaGameEngine::refillOrdersIfNeeded(const LevelCfg& cfg, uint32_t nowMs) 
 }
 
 PizzaGameEngine::Domain PizzaGameEngine::pickPreferredDomain() const {
+  // Level 1 is intended as a quiet intro round.
+  // - No sound identities are mapped to houses.
+  // - Therefore we must not generate sound-domain clues.
+  if (m_level <= 1) {
+    switch (rng() % 3) {
+      default:
+      case 0: return Domain::Panel;
+      case 1: return Domain::Window;
+      case 2: return Domain::Physical;
+    }
+  }
+
   switch (rng() % 4) {
     default:
     case 0: return Domain::Panel;
@@ -1047,7 +1065,20 @@ bool PizzaGameEngine::spawnOneOrder(const LevelCfg& cfg, uint32_t nowMs) {
   Domain pref = pickPreferredDomain();
 
   for (uint8_t attempt=0; attempt<14 && !okClue; ++attempt) {
-    Domain d = (attempt==0) ? pref : (Domain)(rng() % 4);
+    Domain d = pref;
+    if (attempt != 0) {
+      // Level 1 has no sound identities, so avoid wasting attempts on sound-domain clues.
+      if (m_level <= 1) {
+        switch (rng() % 3) {
+          default:
+          case 0: d = Domain::Panel;    break;
+          case 1: d = Domain::Window;   break;
+          case 2: d = Domain::Physical; break;
+        }
+      } else {
+        d = (Domain)(rng() % 4);
+      }
+    }
 
     okClue = buildUniqueSingle(d, house, dest, sizeof(dest), sig, sizeof(sig));
     if (!okClue && cfg.compositesEnabled) {

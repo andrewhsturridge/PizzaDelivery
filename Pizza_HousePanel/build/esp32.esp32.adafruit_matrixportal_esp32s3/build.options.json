@@ -1,0 +1,10 @@
+{
+  "additionalFiles": "",
+  "builtInLibrariesFolders": "/Users/andrewhsturridge/Library/Arduino15/libraries",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:adafruit_matrixportal_esp32s3:UploadSpeed=921600,USBMode=default,CDCOnBoot=cdc,MSCOnBoot=default,DFUOnBoot=default,UploadMode=cdc,CPUFreq=240,FlashMode=qio,FlashSize=8M,PartitionScheme=tinyuf2,DebugLevel=none,PSRAM=enabled,LoopCore=1,EventsCore=1,EraseFlash=none,ZigbeeMode=default",
+  "hardwareFolders": "/Users/andrewhsturridge/Library/Arduino15/packages",
+  "otherLibrariesFolders": "/Users/andrewhsturridge/Documents/Arduino/libraries",
+  "sketchLocation": "/Users/andrewhsturridge/Documents/Arduino/PizzaDelivery/Pizza_HousePanel"
+}

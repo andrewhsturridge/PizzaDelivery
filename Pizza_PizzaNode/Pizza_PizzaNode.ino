@@ -76,6 +76,18 @@ static uint8_t g_uid[10]; static uint8_t g_uidLen = 0;
 static bool    g_haveTag = false;
 static uint32_t g_tagLastSeen = 0;
 static uint8_t g_mask = 0; // bits: PEP, MUSH, PEPPERS, PINEAPPLE, HAM
+static bool    g_maskDirty = false; // unsent local edits exist
+static bool    g_userEdited = false; // once any local edit happens, ignore late ING_SNAPSHOT
+
+// Safety: publish topping edits immediately when the RFID first goes missing
+// (likely removal), so Central can validate deliveries without waiting for the
+// full detach timeout.
+static const uint32_t EARLY_RESEND_GAP_MS = 35;
+static const uint8_t  EARLY_RESEND_COUNT  = 2; // additional re-sends besides the first
+static bool     g_tagMissing = false;
+static uint32_t g_earlyResendAt = 0;
+static bool     g_earlyResendPending = false;
+static uint8_t  g_earlyResendLeft = 0;
 
 // Debounce
 static uint8_t  g_lastBtn[5] = {1,1,1,1,1};
@@ -134,13 +146,34 @@ static void sendIngrQuery() {
 static void tagAttached(const uint8_t* uid, uint8_t len) {
   memcpy(g_uid, uid, len); g_uidLen = len; g_haveTag = true; g_tagLastSeen = millis();
   g_mask = 0; lampsApply(g_mask);            // default to blank until snapshot arrives
+  g_maskDirty = false;
+  g_userEdited = false;
+
+  // Reset "missing" helpers for this new session
+  g_tagMissing = false;
+  g_earlyResendPending = false;
+  g_earlyResendAt = 0;
+  g_earlyResendLeft = 0;
   sendIngrQuery();                           // NEW: ask Central for current mask
   PZ_LOGI("TAG ATTACH uidLen=%u", len);
 }
 
 static void tagDetached() {
+  // Final backstop publish on confirmed removal. (We may also have already
+  // sent one or more "early" updates when the tag first went missing.)
+  if (g_haveTag && g_uidLen && g_maskDirty) {
+    sendIngrUpdate();
+  }
   g_haveTag = false; g_uidLen = 0;
   g_mask = 0; lampsApply(0); // clear lamps when no card
+  g_maskDirty = false;
+  g_userEdited = false;
+
+  // Clear missing helpers
+  g_tagMissing = false;
+  g_earlyResendPending = false;
+  g_earlyResendAt = 0;
+  g_earlyResendLeft = 0;
   PZ_LOGI("TAG DETACH");
 }
 
@@ -248,6 +281,14 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
 
     // Only apply if we still have a card, and it’s the same UID
     if (g_haveTag && s->uid_len == g_uidLen && memcmp(s->uid, g_uid, g_uidLen) == 0) {
+      // If the player has already touched toppings for this pizza, don't let a
+      // late snapshot clobber local state (even if we've already published an
+      // early update while the tag was going missing).
+      if (g_userEdited) {
+        PZ_LOGI("ING_SNAPSHOT ignored (local edits in progress)");
+        return;
+      }
+
       uint8_t newMask = (s->ok ? s->mask : 0);
       if (newMask != g_mask) {
         g_mask = newMask;
@@ -378,14 +419,54 @@ void loop() {
 
   // --- RFID presence / attach / detach ---
   uint8_t uid[10]; uint8_t len=0;
+  const uint32_t now = millis();
   if (PizzaRfid::readUid(uid, len)) {
-    g_tagLastSeen = millis();
+    g_tagLastSeen = now;
+
+    // Tag is present again -> end any "missing streak" and cancel scheduled resends.
+    g_tagMissing = false;
+    g_earlyResendPending = false;
+    g_earlyResendAt = 0;
+    g_earlyResendLeft = 0;
+
     if (!g_haveTag || len != g_uidLen || memcmp(uid, g_uid, len) != 0) {
       tagAttached(uid, len);
     }
   } else {
-    if (g_haveTag && (millis() - g_tagLastSeen) > 500) {
-      tagDetached();
+    if (g_haveTag) {
+      // The reader did not see the tag on this loop.
+      // If the player has made edits, push the mask immediately on the FIRST miss
+      // (likely removal), then do 1-2 quick resends to improve delivery reliability.
+      if (!g_tagMissing) {
+        g_tagMissing = true;
+        if (g_maskDirty) {
+          sendIngrUpdate();
+          g_earlyResendPending = (EARLY_RESEND_COUNT > 0);
+          g_earlyResendLeft = EARLY_RESEND_COUNT;
+          g_earlyResendAt = now + EARLY_RESEND_GAP_MS;
+          PZ_LOGI("ING_UPDATE early (tag missing)");
+        }
+      } else {
+        // Already missing: perform any scheduled quick resend(s)
+        if (g_earlyResendPending && (int32_t)(now - g_earlyResendAt) >= 0) {
+          if (g_maskDirty) {
+            sendIngrUpdate();
+            PZ_LOGI("ING_UPDATE early resend");
+          }
+          if (g_earlyResendLeft > 0) g_earlyResendLeft--;
+          if (g_earlyResendLeft > 0) {
+            g_earlyResendAt = now + EARLY_RESEND_GAP_MS;
+          } else {
+            g_earlyResendPending = false;
+            g_earlyResendAt = 0;
+          }
+        }
+      }
+
+      // Confirmed detach (long enough without reads)
+      if ((now - g_tagLastSeen) > 500) {
+        tagDetached();
+      }
     }
   }
 
@@ -396,14 +477,20 @@ void loop() {
     if (raw != g_lastBtn[i] && (millis() - g_lastChg[i]) > DEBOUNCE_MS) {
       g_lastBtn[i] = raw; g_lastChg[i] = millis();
       if (raw == LOW) { // pressed
-        if (g_haveTag) {
+        // Only allow edits while the tag is being actively read.
+        // This prevents "last second" toggles after the pizza is lifted off the
+        // reader (or during a missing streak) which could otherwise desync what
+        // Central validates.
+        const bool tagLiveNow = (g_haveTag && !g_tagMissing);
+        if (tagLiveNow) {
           g_mask ^= (1<<i);
           lampsApply(g_mask);
-          sendIngrUpdate();
+          g_userEdited = true;
+          g_maskDirty = true; // publish when the tag goes missing / removed (with quick resends)
           PZ_LOGI("Toggled %s -> %s", INAME[i], (g_mask&(1<<i))?"ON":"OFF");
         } else {
           // No tag present → ignore (lamps remain off)
-          PZ_LOGI("Button %d pressed but no tag present", i+1);
+          PZ_LOGI("Button %d pressed but tag not being read", i+1);
         }
       }
     }

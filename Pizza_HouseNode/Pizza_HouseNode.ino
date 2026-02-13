@@ -334,6 +334,18 @@ static inline bool isGeneratedBeepIdentity(uint8_t clipId) {
 static uint8_t adjustedVolForClip(uint8_t clipId, uint8_t requestedVol) {
   uint8_t v = requestedVol ? requestedVol : 10;
 
+  // Clip-specific attenuation:
+  // The "fire alarm" clip is mastered very hot and is unpleasantly loud compared
+  // to the rest of the library. Scale it down aggressively in software.
+  // (Clip IDs are defined centrally in PizzaGameEngine.cpp.)
+  if (clipId == 4) {
+    // ~25% of requested volume; clamp to a comfortable ceiling.
+    uint16_t scaled = (uint16_t)v * 25 / 100;
+    if (scaled < 4)  scaled = 4;
+    if (scaled > 20) scaled = 20;
+    v = (uint8_t)scaled;
+  }
+
   if (isGeneratedBeepIdentity(clipId)) {
     // ~60% volume, clamped. At v=10 this becomes ~6.
     uint16_t scaled = (uint16_t)v * 60 / 100;
@@ -740,14 +752,18 @@ void setup() {
 void loop() {
   PizzaNow::loop();
 
+  // Snapshot game phase once per loop to avoid race conditions where GAME_STATE
+  // arrives mid-loop (which could enable input without us processing the phase edge).
+  const uint8_t phase = g_gamePhase;
+
   if (g_helloDueAt && (int32_t)(millis() - g_helloDueAt) >= 0) {
     sendHello();
     g_helloDueAt = 0;
   }
 
   // --- GAME_STATE edge handling ---
-  if (g_gamePhase != g_prevGamePhase) {
-    uint8_t newPhase = g_gamePhase;
+  if (phase != g_prevGamePhase) {
+    uint8_t newPhase = phase;
     g_prevGamePhase = newPhase;
 
     // When the game is not Running, hard-disable player scans.
@@ -895,7 +911,7 @@ void loop() {
     const bool audioBusyPoll = PizzaAudioFS::isPlaying();
     nextPoll = millis() + (audioBusyPoll ? 120 : 50); // slow RFID polling slightly while audio plays
 
-    const bool inputEnabled = (g_gamePhase == 1) && (g_houseId != 0);
+    const bool inputEnabled = (phase == 1) && (g_houseId != 0);
     if (!inputEnabled) {
       // Game idle (or unclaimed) => ignore all scans; keep station quiet.
       g_state = HS_IDLE;
