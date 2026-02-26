@@ -63,7 +63,7 @@
 // 1 = Keep legacy/debug Serial prints (CLI help, verbose logs).
 // 0 = Suppress all non-!PMS Serial prints (clean PMS serial output).
 #ifndef PMS_DEBUG_SERIAL
-#define PMS_DEBUG_SERIAL 1
+#define PMS_DEBUG_SERIAL 0
 #endif
 
 #ifndef PMS_STATUS_PERIOD_MS
@@ -1451,9 +1451,20 @@ static void pmsTick() {
 
   const bool running = (g_game.phase == GP_RUNNING) && (g_engine.phase() == PizzaGameEngine::Phase::Running);
 
-  const uint8_t  curLevel = running ? g_engine.level() : 1;
-  const uint16_t curScore = running ? (uint16_t)g_engine.successTotal() : 0;
-  const uint8_t  curLives = running ? g_engine.livesLeft() : (uint8_t)g_engine.livesMax();
+  // Snapshot the engine values. Note: these remain valid even right after a run ends,
+  // and we must use them to report the FINAL lives/score (including the last life loss).
+  const uint8_t  engLevel    = g_engine.level();
+  const uint16_t engScore    = (uint16_t)g_engine.successTotal();
+  const uint8_t  engLives    = g_engine.livesLeft();
+  const uint8_t  engLivesMax = (uint8_t)g_engine.livesMax();
+
+  // If the run ended between PMS ticks, `running` is already false.
+  // We still want to emit the final life/score deltas AND game_end with the true final values.
+  const bool treatAsFinalSnapshot = (s_pmsBaselineValid && s_pmsWasRunning && !running);
+
+  const uint8_t  curLevel = (running || treatAsFinalSnapshot) ? engLevel : 1;
+  const uint16_t curScore = (running || treatAsFinalSnapshot) ? engScore : 0;
+  const uint8_t  curLives = (running || treatAsFinalSnapshot) ? engLives : engLivesMax;
 
   uint32_t tleftMs = 0;
   if (running) {
@@ -1486,14 +1497,23 @@ static void pmsTick() {
     if (!s_pmsWasRunning && running) {
       pmsPrintEventGameStart(curLevel);
     } else if (s_pmsWasRunning && !running) {
+      // IMPORTANT: the last life loss often happens on the same tick as the game ends.
+      // Emit final deltas BEFORE game_end so the PMS doesn't "miss" the last life.
+      if (scoreDelta > 0) {
+        pmsPrintEventScore(scoreDelta, curScore);
+      }
+      if (livesDelta < 0) {
+        pmsPrintEventLife(livesDelta, curLives);
+      }
+
       const char* reason = s_pmsEndReasonHint;
       if (!reason) {
         // Best-effort fallback
-        if (s_pmsLastLives == 0) reason = "no_lives";
+        if (curLives == 0) reason = "no_lives";
         else if ((int32_t)(now - g_game.endsAt) >= 0) reason = "timeup";
         else reason = "stopped";
       }
-      pmsPrintEventGameEnd(reason, s_pmsLastScore, s_pmsLastLives);
+      pmsPrintEventGameEnd(reason, curScore, curLives);
       s_pmsEndReasonHint = nullptr;
     }
   }
@@ -1524,7 +1544,7 @@ static void pmsTick() {
     // reset stored values so next run doesn't emit spurious deltas
     s_pmsLastLevel = 1;
     s_pmsLastScore = 0;
-    s_pmsLastLives = (uint8_t)g_engine.livesMax();
+    s_pmsLastLives = engLivesMax;
   }
 }
 
