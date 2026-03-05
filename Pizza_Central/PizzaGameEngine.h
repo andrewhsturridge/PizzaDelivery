@@ -169,6 +169,11 @@ public:
   void debugPrintMapping() const;
   void debugPrintOrders(uint32_t nowMs) const;
 
+  // Re-send the CURRENT house identities (panel/window/sound) without changing the mapping.
+  // Useful when a house panel/node reboots mid-run or to cover ESPNOW packet loss.
+  void resendMapping();
+  void resendHouse(uint8_t houseId);
+
 private:
   // ----- Internal: randomness -----
   uint32_t rng() const;

@@ -254,9 +254,18 @@ static uint8_t  g_lastUid[10];
 static uint8_t  g_lastLen = 0;
 
 static const uint32_t RESULT_TIMEOUT_MS = 1500;   // wait for Central
-static const uint32_t REMOVAL_STABLE_MS = 250;    // require stable absence
+// Require stable absence before allowing the next scan.
+// If this is too low, players can accidentally double/triple scan while removing/replacing a pizza.
+static const uint32_t REMOVAL_STABLE_MS = 450;
+
+// De-dupe: ignore the SAME UID re-scanned at the SAME house within this window.
+// This is a "seatbelt" against RF jitter/hand bounce causing rapid re-scans.
+static const uint32_t SCAN_DEDUP_MS     = 900;
 static uint32_t g_stateDeadline = 0;
 static uint32_t g_absentSince  = 0;
+
+// Timestamp of the last scan we actually transmitted (paired with g_lastUid/g_lastLen)
+static uint32_t g_lastScanMs = 0;
 
 // window fx  state
 static uint8_t  g_winFx   = WIN_FX_OFF;
@@ -297,6 +306,11 @@ static SoundPlayPayload g_pendSoundPayload;
 
 static volatile bool g_pendDigital = false;
 static HouseDigitalSetPayload g_pendDigitalPayload;
+
+// Dedupe: repeated HOUSE_DIGITAL_SET payloads (mapping resends) should not reset animations/audio
+static bool g_haveLastDigitalApplied = false;
+static HouseDigitalSetPayload g_lastDigitalApplied{};
+
 
 // Forward declares
 static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, const uint8_t srcMac[6]);
@@ -771,11 +785,19 @@ void loop() {
       g_state = HS_IDLE;
       g_haveResult = false;
       g_absentSince = 0;
+
+      // Clear scan de-dupe history between runs/idle states.
+      g_lastLen = 0;
+      g_lastScanMs = 0;
     } else {
       // On enable, require card removal before allowing a scan.
       g_state = HS_WAIT_REMOVAL;
       g_haveResult = false;
       g_absentSince = 0;
+
+      // Also clear de-dupe on enable so the first real scan always counts.
+      g_lastLen = 0;
+      g_lastScanMs = 0;
     }
   }
 
@@ -792,6 +814,13 @@ void loop() {
   portEXIT_CRITICAL(&g_pendMux);
 
   if (doDigital) {
+    // Skip if identical to last applied payload (prevents window animation resets on resends).
+    if (g_haveLastDigitalApplied && memcmp(&pendDigital, &g_lastDigitalApplied, sizeof(HouseDigitalSetPayload)) == 0) {
+      // no-op
+    } else {
+      g_lastDigitalApplied = pendDigital;
+      g_haveLastDigitalApplied = true;
+
     // Window LEDs
     if (pendDigital.flags & 0x01) {
       applyWindow(pendDigital.win_fx, pendDigital.win_h, pendDigital.win_s, pendDigital.win_v, pendDigital.win_speed);
@@ -834,6 +863,7 @@ void loop() {
           }
         }
       }
+    }
     }
   }
 
@@ -926,11 +956,24 @@ void loop() {
         // Card present? Read UID once and send exactly one scan.
         uint8_t uid[10]; uint8_t uidLen = 0;
         if (PizzaRfid::readUid(uid, uidLen)) {
+          const uint32_t nowMs = millis();
+
+          // De-dupe: if we very recently scanned the SAME UID at this house,
+          // treat it as an accidental re-scan and require removal again.
+          if (g_lastLen == uidLen && uidLen > 0 && memcmp(g_lastUid, uid, uidLen) == 0 &&
+              g_lastScanMs != 0 && (uint32_t)(nowMs - g_lastScanMs) < (uint32_t)SCAN_DEDUP_MS) {
+            g_absentSince = 0;
+            g_state = HS_WAIT_REMOVAL;
+            break;
+          }
+
           memcpy(g_lastUid, uid, uidLen); g_lastLen = uidLen;
+          g_lastScanMs = nowMs;
+
           sendDeliverScan(uid, uidLen);                       // existing helper
           g_haveResult   = false;
           g_state        = HS_WAIT_RESULT;
-          g_stateDeadline= millis() + RESULT_TIMEOUT_MS;
+          g_stateDeadline= nowMs + RESULT_TIMEOUT_MS;
         }
       } break;
 
@@ -951,8 +994,11 @@ void loop() {
 
       case HS_WAIT_REMOVAL: {
         // Stay here until no card for a short, stable window
-        uint8_t uid[10]; uint8_t uidLen = 0;
-        if (!PizzaRfid::readUid(uid, uidLen)) {
+        // IMPORTANT: use "present()" here (not readUid()).
+        // UID reads can fail intermittently even while a card is still in-field.
+        // If we use readUid() for removal detection, those brief failures can look
+        // like a removal and allow accidental double/triple scans.
+        if (!PizzaRfid::present()) {
           if (g_absentSince == 0) g_absentSince = millis();
           if ((int32_t)(millis() - g_absentSince) >= (int32_t)REMOVAL_STABLE_MS) {
             g_state = HS_IDLE; // re-arm

@@ -923,6 +923,33 @@ void PizzaGameEngine::pushMappingToHouses() {
   }
 }
 
+void PizzaGameEngine::resendMapping() {
+  pushMappingToHouses();
+}
+
+void PizzaGameEngine::resendHouse(uint8_t houseId) {
+  if (!m_io.sendHouseDigital) return;
+  if (houseId < 1 || houseId > kHouseCount) return;
+
+  const HouseIdentity& id = m_id[houseId];
+
+  // Always-on: window + panel + speaker
+  uint8_t flags = 0x01 | 0x02 | 0x04;
+  bool stopNow = (id.spkClip == 0);
+
+  m_io.sendHouseDigital(
+    houseId,
+    flags,
+    // window
+    id.winFx, id.winH, id.winS, id.winV, id.winSpeed,
+    // panel
+    id.panelMode, id.panelText, id.panelStyle, id.panelSpeed, id.panelBright,
+    // speaker
+    id.spkClip, id.spkVol, id.spkLoop, stopNow
+  );
+}
+
+
 // -----------------------------
 // Orders
 // -----------------------------

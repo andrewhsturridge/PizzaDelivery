@@ -120,6 +120,34 @@ struct TagEntry { uint8_t len; uint8_t uid[10]; uint8_t mask; uint32_t ts; };
 static TagEntry g_tags[32];
 static uint8_t  g_tagCount = 0;
 
+// -----------------------------------------------------------------
+// Delivery scan de-dupe
+//
+// Problem: MFRC522 UID reads can "flicker" during placement/removal,
+// and players can also accidentally double/triple scan the same pizza.
+// Each DELIVER_SCAN used to cost multiple lives (or re-trigger success).
+//
+// Fix: per-house, de-dupe the same UID within a short window. We still
+// reply with the previous verdict so the house doesn't time out, but we
+// do NOT apply engine state changes twice.
+// -----------------------------------------------------------------
+static const uint32_t DELIVER_DEDUP_MS = 900;
+
+struct DeliverDedupEntry {
+  bool     valid;
+  uint8_t  uid_len;
+  uint8_t  uid[10];
+  uint32_t at_ms;
+  uint8_t  ok;      // 0/1
+  uint8_t  reason;  // DeliverReason
+};
+
+static DeliverDedupEntry g_deliverDedup[7]; // index by house_id (1..6)
+
+static void deliverDedupReset() {
+  memset(g_deliverDedup, 0, sizeof(g_deliverDedup));
+}
+
 /*** CENTRAL: Orders storage ***/
 static PzOrderItemSetPayload g_orders[PZ_ORDERS_MAX];
 static uint8_t g_orderCount = 0;
@@ -222,7 +250,7 @@ struct OrdersDrip {
   bool     active;
   uint8_t  window;     // how many items to send (0..3)
   uint8_t  idx;        // current item index 0..window-1
-  uint8_t  stage;      // 0=send RESET, 1=send item[idx] pass1, 2=pass2, 3=advance idx
+  uint8_t  stage;      // 0=RESET pass1, 1=RESET pass2, 2=item[idx] pass1, 3=pass2, 4=advance idx
   uint32_t dueAt;      // next action time
 };
 static OrdersDrip s_ordersDrip = {false,0,0,0,0};
@@ -231,6 +259,109 @@ static OrdersDrip s_ordersDrip = {false,0,0,0,0};
 // Level transitions require pushing new house identities (window/panel/sound).
 // ESPNOW is lossy, so we resend the mapping a few times to ensure every house updates.
 // HouseNode/HousePanel treat identical mapping as a no-op (dedupe), so resends are safe.
+
+static const uint8_t  MAP_RESYNC_DEFAULT_PASSES = 3;   // how many full passes (1 pass = houses 1..6)
+static const uint16_t MAP_RESYNC_GAP_HOUSE_MS   = 25;  // spacing between per-house mapping sends
+static const uint16_t MAP_RESYNC_GAP_PASS_MS    = 180; // pause between passes
+
+struct MapResync {
+  bool     active;
+  uint8_t  passesLeft;   // remaining full passes
+  uint8_t  nextHouse;    // 1..6
+  uint32_t dueAt;        // next action time
+};
+static MapResync s_mapResync = {false, 0, 1, 0};
+
+struct HouseResync {
+  bool     active;
+  uint8_t  house;        // 1..6
+  uint8_t  repeatsLeft;  // number of repeats
+  uint16_t gapMs;        // gap between repeats
+  uint32_t dueAt;        // next send time
+};
+static HouseResync s_houseResync = {false, 0, 0, 0, 0};
+
+static void mapResyncStop() {
+  s_mapResync.active = false;
+  s_mapResync.passesLeft = 0;
+  s_mapResync.nextHouse = 1;
+  s_mapResync.dueAt = 0;
+}
+
+static void mapResyncStart(uint8_t passes = MAP_RESYNC_DEFAULT_PASSES) {
+  if (passes == 0) passes = 1;
+  s_mapResync.active = true;
+  s_mapResync.passesLeft = passes;
+  s_mapResync.nextHouse = 1;
+  s_mapResync.dueAt = millis();
+}
+
+static void mapResyncTick() {
+  if (!s_mapResync.active) return;
+  const uint32_t now = millis();
+  if ((int32_t)(now - s_mapResync.dueAt) < 0) return;
+
+  const bool running = (g_game.phase == GP_RUNNING) && (g_engine.phase() == PizzaGameEngine::Phase::Running);
+  if (!running) {
+    mapResyncStop();
+    return;
+  }
+
+  g_engine.resendHouse(s_mapResync.nextHouse);
+
+  s_mapResync.nextHouse++;
+  if (s_mapResync.nextHouse > 6) {
+    s_mapResync.nextHouse = 1;
+    if (s_mapResync.passesLeft > 0) s_mapResync.passesLeft--;
+    if (s_mapResync.passesLeft == 0) {
+      s_mapResync.active = false;
+      return;
+    }
+    s_mapResync.dueAt = now + MAP_RESYNC_GAP_PASS_MS;
+  } else {
+    s_mapResync.dueAt = now + MAP_RESYNC_GAP_HOUSE_MS;
+  }
+}
+
+static void houseResyncStop() {
+  s_houseResync.active = false;
+  s_houseResync.house = 0;
+  s_houseResync.repeatsLeft = 0;
+  s_houseResync.gapMs = 0;
+  s_houseResync.dueAt = 0;
+}
+
+static void houseResyncStart(uint8_t houseId, uint8_t repeats = 2, uint16_t gapMs = 120) {
+  if (houseId < 1 || houseId > 6) return;
+  if (repeats == 0) repeats = 1;
+
+  s_houseResync.active = true;
+  s_houseResync.house = houseId;
+  s_houseResync.repeatsLeft = repeats;
+  s_houseResync.gapMs = gapMs;
+  s_houseResync.dueAt = millis();
+}
+
+static void houseResyncTick() {
+  if (!s_houseResync.active) return;
+  const uint32_t now = millis();
+  if ((int32_t)(now - s_houseResync.dueAt) < 0) return;
+
+  const bool running = (g_game.phase == GP_RUNNING) && (g_engine.phase() == PizzaGameEngine::Phase::Running);
+  if (!running) {
+    houseResyncStop();
+    return;
+  }
+
+  g_engine.resendHouse(s_houseResync.house);
+
+  if (s_houseResync.repeatsLeft > 0) s_houseResync.repeatsLeft--;
+  if (s_houseResync.repeatsLeft == 0) {
+    s_houseResync.active = false;
+    return;
+  }
+  s_houseResync.dueAt = now + s_houseResync.gapMs;
+}
 
 // --- GAME_STATE broadcaster (Central -> ALL) ---
 // Player-interactive stations (HOUSE_NODE / ORDERS_NODE / PIZZA_NODE) should hard-disable inputs
@@ -328,6 +459,9 @@ static void gameStart(uint16_t minutes, uint8_t level){
   // Reset ingredient cache so old pizzas don't carry into a new run
   ingredientsResetAll();
 
+  // Reset delivery scan de-dupe so the first scan of a new run is never suppressed.
+  deliverDedupReset();
+
   // Clear any previous order window on the stations/panels
   ordersResetLocal();
 
@@ -338,16 +472,24 @@ static void gameStart(uint16_t minutes, uint8_t level){
   // Stop any pending "game over" animation from a previous run
   s_goFx.active = false;
 
+  // Stop any pending mapping resync tasks from a previous run
+  mapResyncStop();
+  houseResyncStop();
+
   // Start engine (build house identities + spawn initial orders)
   if (level < 1) level = 1;
   if (level > 5) level = 5;
   g_engine.startGameAtLevel((uint8_t)level, now);
 
-  // Resend mapping a couple of times right after game start (covers occasional packet loss)
-  requestGameStateBurst(6);
+  // Mapping push happens inside engine start.
+  // ESPNOW is lossy, and a missed mapping makes orders look "impossible"
+  // (e.g. the Orders panel says "house #7" but no house shows 7).
+  // So we drip-resend the mapping for ~1s.
+  mapResyncStart();
 
-  // Broadcast first order window (OrdersStation will start countdown from remain_s)
-  ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
+  // Broadcast first order window (OrdersStation will start countdown from remain_s).
+  // Small delay gives house panels a moment to update to the new mapping before players see the first orders.
+  ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/250);
 
   // Let all player stations know the run is live (and repeat a few times for reliability).
   requestGameStateBurst(6);
@@ -421,6 +563,10 @@ static void gameStop(){
   // Stop engine + clear active orders
   g_engine.stopGame(now);
 
+  // Stop any pending mapping resync tasks.
+  mapResyncStop();
+  houseResyncStop();
+
   // Immediately disable player inputs everywhere (houses/pizza/order stations).
   requestGameStateBurst(6);
 
@@ -432,6 +578,9 @@ static void gameStop(){
 
   // Also clear remembered toppings at game end
   ingredientsResetAll();
+
+  // Clear delivery scan de-dupe history between runs.
+  deliverDedupReset();
 
   DBG_PRINTLN("game: STOP");
   gamePrintStatus();
@@ -477,16 +626,24 @@ static void gameTick(){
   const bool changed = g_engine.tick(now);
   const uint8_t levelAfter  = g_engine.level();
 
-  // If the engine advanced to a new level, resend mapping a few times.
-  // (If a house misses this, it will still show the previous level identity and orders will look "wrong".)
-  if (levelAfter != levelBefore) {
+  const bool levelChanged = (levelAfter != levelBefore);
+
+  // If the engine advanced to a new level, re-sync house identities.
+  // (If a house misses the mapping update, it may still show the previous level identity and orders will look "wrong".)
+  if (levelChanged) {
     DBG_PRINTF("[central] LEVEL CHANGE %u -> %u\n", (unsigned)levelBefore, (unsigned)levelAfter);
+
+    // Drip-resend mapping across ~1s to cover ESPNOW packet loss.
+    mapResyncStart();
+
+    // Stations may gate interactions on level/phase.
     requestGameStateBurst(6);
   }
 
-  // If orders changed (expiry/refill/level-up), push window to OrdersStation
+  // If orders changed (expiry/refill/level-up), push window to OrdersStation.
+  // On a level change, delay slightly so house panels can update before players see the new clues.
   if (changed) {
-    ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
+    ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/(levelChanged ? 250 : 0));
   }
 
   // Engine might end the game (out of lives, completed final level)
@@ -516,9 +673,17 @@ static void ordersPushWindowDripTick() {
   if ((int32_t)(millis() - s_ordersDrip.dueAt) < 0) return;
 
   if (s_ordersDrip.stage == 0) {
-    // RESET
+    // RESET (pass 1)
     ordersSendReset(s_ordersDrip.window);
     s_ordersDrip.stage = 1;
+    s_ordersDrip.dueAt = millis() + ORD_DRIP_GAP_RESET_MS;
+    return;
+  }
+
+  if (s_ordersDrip.stage == 1) {
+    // RESET (pass 2) – covers occasional drop
+    ordersSendReset(s_ordersDrip.window);
+    s_ordersDrip.stage = 2;
     s_ordersDrip.dueAt = millis() + ORD_DRIP_GAP_RESET_MS;
     return;
   }
@@ -537,25 +702,25 @@ static void ordersPushWindowDripTick() {
   PzOrderItemSetPayload it = g_orders[s_ordersDrip.idx];
   it.index = s_ordersDrip.idx;
 
-  if (s_ordersDrip.stage == 1) {
-    // First send of this item
-    ordersSendItem(it);
-    s_ordersDrip.stage = 2;
-    s_ordersDrip.dueAt = millis() + ORD_DRIP_GAP_ITEM_MS;
-    return;
-  }
-
   if (s_ordersDrip.stage == 2) {
-    // Second send (covers occasional drop)
+    // First send of this item
     ordersSendItem(it);
     s_ordersDrip.stage = 3;
     s_ordersDrip.dueAt = millis() + ORD_DRIP_GAP_ITEM_MS;
     return;
   }
 
-  // stage 3: advance to next item
+  if (s_ordersDrip.stage == 3) {
+    // Second send (covers occasional drop)
+    ordersSendItem(it);
+    s_ordersDrip.stage = 4;
+    s_ordersDrip.dueAt = millis() + ORD_DRIP_GAP_ITEM_MS;
+    return;
+  }
+
+  // stage 4: advance to next item
   s_ordersDrip.idx++;
-  s_ordersDrip.stage = 1;
+  s_ordersDrip.stage = 2;
   // immediate next item send allowed (no extra delay), or add a small one:
   // s_ordersDrip.dueAt = millis() + ORD_DRIP_GAP_ITEM_MS;
 }
@@ -1160,6 +1325,24 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     const HelloPayload* h = (const HelloPayload*)payload;
     rosterUpdateFromHello(hdr, h, srcMac);
     PZ_LOGI("HELLO role=%u id=%u fw=%s mac=%s", hdr.role, hdr.house_id, h->fw, macbuf);
+
+    // If a house panel/node reboots mid-run, it will miss the most recent mapping.
+    // Resend the current identity for that house so orders/clues match what the room displays.
+    const bool running = (g_game.phase == GP_RUNNING) && (g_engine.phase() == PizzaGameEngine::Phase::Running);
+    if ((hdr.role == HOUSE_PANEL || hdr.role == HOUSE_NODE) && hdr.house_id >= 1 && hdr.house_id <= 6) {
+      if (running) {
+        // Quick 2x resend for this specific house (covers occasional drop).
+        houseResyncStart(hdr.house_id, /*repeats*/2, /*gapMs*/120);
+      } else {
+        // Keep idle baseline clean (panels/windows/speaker off) even if a device reboots.
+        sendHouseDigital(hdr.house_id,
+          /*flags*/0x01 | 0x02 | 0x04,
+          /*win*/WIN_FX_OFF, 0,0,0,0,
+          /*panel*/PANEL_MODE_TEXT, "", 1,1,0,
+          /*spk*/0, 0, false, /*stopNow*/true
+        );
+      }
+    }
     return;
   }
 
@@ -1187,6 +1370,18 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     if (!running) {
       sendDeliverResult(s->house_id, /*ok*/false, /*reason*/DR_NO_ORDER);
       return;
+    }
+
+    // De-dupe: if the SAME house re-sends the SAME UID within a short window,
+    // reply with the previous verdict but do NOT apply engine changes again.
+    if (s->house_id >= 1 && s->house_id <= PZ_HOUSES) {
+      DeliverDedupEntry& d = g_deliverDedup[s->house_id];
+      if (d.valid && d.uid_len == s->uid_len && d.uid_len > 0 &&
+          memcmp(d.uid, s->uid, d.uid_len) == 0 &&
+          (uint32_t)(nowMs - d.at_ms) < (uint32_t)DELIVER_DEDUP_MS) {
+        sendDeliverResult(s->house_id, d.ok != 0, d.reason);
+        return;
+      }
     }
 
     uint8_t reason = DR_OK;
@@ -1218,16 +1413,40 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     // Tell the house the verdict
     sendDeliverResult(s->house_id, (reason == DR_OK), reason);
 
+    // Record for de-dupe (must happen BEFORE any early returns below).
+    if (s->house_id >= 1 && s->house_id <= PZ_HOUSES) {
+      DeliverDedupEntry& d = g_deliverDedup[s->house_id];
+      d.valid   = true;
+      d.uid_len = s->uid_len;
+      memset(d.uid, 0, sizeof(d.uid));
+      memcpy(d.uid, s->uid, min<uint8_t>(s->uid_len, sizeof(d.uid)));
+      d.at_ms   = nowMs;
+      d.ok      = (reason == DR_OK) ? 1 : 0;
+      d.reason  = reason;
+    }
+
     // Apply outcome
     if (reason == DR_OK) {
       // Success: clear tag ingredients + advance engine
       ingrClearTag(s->uid, s->uid_len);
 
       if (g_game.phase == GP_RUNNING && g_engine.phase() == PizzaGameEngine::Phase::Running) {
+        const uint8_t lvlBefore = g_engine.level();
         bool changed = g_engine.onDeliveryResult(s->house_id, /*ok*/true, reason, nowMs);
-        if (changed) {
-          ordersPushWindowDripStart(/*maxDisplay*/3, ORD_DRIP_START_DELAY_MS);
+        const uint8_t lvlAfter  = g_engine.level();
+        const bool levelChanged = (lvlAfter != lvlBefore);
+
+        // Level-ups can happen inside onDeliveryResult(). If so, we need to re-sync house mapping so
+        // the new order clues match the new house identities (panels/windows/sounds).
+        if (levelChanged) {
+          mapResyncStart();
+          requestGameStateBurst(6);
         }
+
+        if (changed) {
+          ordersPushWindowDripStart(/*maxDisplay*/3, (levelChanged ? 250 : ORD_DRIP_START_DELAY_MS));
+        }
+
         // If that delivery completed the game (final level), stop cleanly
         if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
           #if PMS_STD_ENABLED
@@ -1686,6 +1905,8 @@ void loop() {
   gameTick();
   ordersPushWindowDripTick();
   gameStateTick();
+  mapResyncTick();
+  houseResyncTick();
 
   pmsTick();
 

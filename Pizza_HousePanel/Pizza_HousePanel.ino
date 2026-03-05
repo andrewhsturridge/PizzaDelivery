@@ -22,6 +22,15 @@ Preferences prefs;
 static uint8_t g_houseId = 0; // 0 = unclaimed
 static uint32_t g_helloDueAt = 0;
 
+// Dedupe: avoid re-rendering the same panel payload on mapping resends
+static bool    g_haveLastPanelApplied = false;
+static uint8_t g_lastPanelMode  = 255;
+static char    g_lastPanelText[24] = {0};
+static uint8_t g_lastPanelStyle = 255;
+static uint8_t g_lastPanelSpeed = 255;
+static uint8_t g_lastPanelBright= 255;
+
+
 // --- OTA deferral ---
 static volatile bool g_otaPending = false;
 static char g_otaUrl[160] = {0};
@@ -286,6 +295,23 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     if (p->house_id == g_houseId) {
       PZ_LOGI("PANEL_TEXT: id=%u \"%s\" style=%u speed=%u bright=%u",
               p->house_id, p->text, p->style, p->speed, p->bright);
+            // Dedupe identical repeats (prevents flicker if Central resends mapping)
+      if (g_haveLastPanelApplied &&
+          g_lastPanelMode == PANEL_MODE_TEXT &&
+          g_lastPanelStyle == p->style &&
+          g_lastPanelSpeed == p->speed &&
+          g_lastPanelBright == p->bright &&
+          strncmp(g_lastPanelText, p->text, sizeof(g_lastPanelText)) == 0) {
+        return;
+      }
+
+      g_haveLastPanelApplied = true;
+      g_lastPanelMode = PANEL_MODE_TEXT;
+      strlcpy(g_lastPanelText, p->text, sizeof(g_lastPanelText));
+      g_lastPanelStyle = p->style;
+      g_lastPanelSpeed = p->speed;
+      g_lastPanelBright = p->bright;
+
       renderPanelText(p->text, p->style, p->speed, p->bright);
     }
     return;
@@ -309,6 +335,23 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     if (p->house_id != g_houseId) return;
 
     if (p->flags & 0x02) {
+      // Dedupe identical mapping resends (prevents flicker).
+      if (g_haveLastPanelApplied &&
+          g_lastPanelMode == p->panel_mode &&
+          g_lastPanelStyle == p->panel_style &&
+          g_lastPanelSpeed == p->panel_speed &&
+          g_lastPanelBright == p->panel_bright &&
+          strncmp(g_lastPanelText, p->panel_text, sizeof(g_lastPanelText)) == 0) {
+        return;
+      }
+
+      g_haveLastPanelApplied = true;
+      g_lastPanelMode = p->panel_mode;
+      strlcpy(g_lastPanelText, p->panel_text, sizeof(g_lastPanelText));
+      g_lastPanelStyle = p->panel_style;
+      g_lastPanelSpeed = p->panel_speed;
+      g_lastPanelBright = p->panel_bright;
+
       if (p->panel_mode == PANEL_MODE_TEXT) {
         renderPanelText(p->panel_text, p->panel_style, p->panel_speed, p->panel_bright);
       } else if (p->panel_mode == PANEL_MODE_NUMBER) {
