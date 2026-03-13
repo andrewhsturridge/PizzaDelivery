@@ -18,7 +18,8 @@
 //     !PMS STATUS v=1 state=playing level=.. score=.. lives=.. tleft_ms=.. last_reason=..
 //       (STATUS is NOT emitted while idle)
 //     !PMS EVENT v=1 name=game_start level=..
-//     !PMS EVENT v=1 name=game_end reason=timeup|no_lives|stopped score=.. lives=..
+//     !PMS EVENT v=1 name=game_end reason=success|no_lives|stopped score=.. lives=..
+//       success = either survive the overall run timer or complete level 5
 //     !PMS EVENT v=1 name=score delta=.. total=.. bonus=0
 //     !PMS EVENT v=1 name=life delta=-1 lives=..
 //
@@ -71,8 +72,8 @@
 #endif
 
 #if PMS_STD_ENABLED
-// End reason hint used for !PMS game_end reporting (set by STOP/TIMEUP/NO_LIVES code paths)
-static const char* s_pmsEndReasonHint = nullptr; // "stopped"|"timeup"|"no_lives"
+// End reason hint used for !PMS game_end reporting.
+static const char* s_pmsEndReasonHint = nullptr; // "success"|"no_lives"|"stopped"
 #endif
 
 #if PMS_DEBUG_SERIAL
@@ -235,7 +236,13 @@ struct GameState {
   /*genLevel*/0
 };
 
+static constexpr uint8_t GE_NONE    = 0;
+static constexpr uint8_t GE_STOPPED = 1;
+static constexpr uint8_t GE_SUCCESS = 2;
+static constexpr uint8_t GE_LOSS    = 3;
+
 static uint32_t g_gameTickDueAt = 0;
+static uint8_t g_lastGameEndKind = GE_NONE;
 
 // Level 1 config
 static const uint8_t L1_SEED_ORDERS = 3;
@@ -371,16 +378,18 @@ static uint8_t  g_gameStateBurstLeft = 0;
 
 static void sendGameStateNow() {
   GameStatePayload p{};
-  // Compute phase from Central + Engine (engine is source of truth while running).
+  // Exposed phase is owned by Central.
+  // While a run is active we still require the engine to agree it is Running.
   if (g_game.phase == GP_RUNNING && g_engine.phase() == PizzaGameEngine::Phase::Running) {
     p.phase = 1;
-  } else if (g_game.phase == GP_OVER || g_engine.phase() == PizzaGameEngine::Phase::Over) {
+  } else if (g_game.phase == GP_OVER) {
     p.phase = 2;
   } else {
     p.phase = 0;
   }
   p.level = g_engine.level();
-  p.rsv0 = 0; p.rsv1 = 0;
+  p.rsv0 = (uint8_t)g_lastGameEndKind; // 0=none,1=stopped,2=success,3=loss
+  p.rsv1 = 0;
 
   uint8_t buf[64];
   size_t n = PizzaProtocol::pack(GAME_STATE, CENTRAL, 0, g_seq++, &p, sizeof(p), buf, sizeof(buf));
@@ -438,10 +447,41 @@ static void gamePrintStatus(){
 }
 
 struct GameOverFx {
-  bool     active;
-  uint8_t  step;    // 0..N
-  uint32_t nextAt;
-} s_goFx = {false, 0, 0};
+  bool        active;
+  uint8_t     step;    // 0..N
+  uint32_t    nextAt;
+  uint8_t     kind;
+} s_goFx = {false, 0, 0, GE_NONE};
+
+static const char* gameEndKindToPmsReason(uint8_t kind) {
+  switch (kind) {
+    case GE_SUCCESS: return "success";
+    case GE_LOSS:    return "no_lives";
+    case GE_STOPPED: return "stopped";
+    default:         return nullptr;
+  }
+}
+
+static const char* gameEndKindLabel(uint8_t kind) {
+  const char* s = gameEndKindToPmsReason(kind);
+  return s ? s : "none";
+}
+
+static uint8_t gameEndKindFromEngine() {
+  return (g_engine.livesLeft() == 0) ? GE_LOSS : GE_SUCCESS;
+}
+
+static void housesAllOff();
+
+static void gameFinalizeToIdle() {
+  housesAllOff();
+  s_goFx.active = false;
+  s_goFx.kind   = GE_NONE;
+  g_game.phase  = GP_IDLE;
+  requestGameStateBurst(6);
+  DBG_PRINTF("game: OVER -> IDLE (%s)\n", gameEndKindLabel(g_lastGameEndKind));
+  gamePrintStatus();
+}
 
 static void gameStart(uint16_t minutes, uint8_t level){
   // Level is owned by PizzaGameEngine; CLI can start at different levels for testing.
@@ -469,8 +509,13 @@ static void gameStart(uint16_t minutes, uint8_t level){
   if (g_game.livesMax == 0) g_game.livesMax = 5;
   g_engine.setLivesMax(g_game.livesMax);
 
-  // Stop any pending "game over" animation from a previous run
+  // Stop any pending end-of-run animation from a previous run
   s_goFx.active = false;
+  s_goFx.kind   = GE_NONE;
+  g_lastGameEndKind = GE_NONE;
+  #if PMS_STD_ENABLED
+  s_pmsEndReasonHint = nullptr;
+  #endif
 
   // Stop any pending mapping resync tasks from a previous run
   mapResyncStop();
@@ -513,13 +558,16 @@ static void housesAllOff(){
   }
 }
 
-// Simple non-blocking game-over animation: all windows blink red a few times,
-// then everything turns off and we return to IDLE.
+// Simple non-blocking end-of-run animation.
+// - success: green flashes
+// - loss:    red flashes
+// - stopped: immediate quiet reset to idle
 
-static void gameOverFxStart() {
+static void gameOverFxStart(uint8_t kind) {
   s_goFx.active = true;
   s_goFx.step   = 0;
   s_goFx.nextAt = millis();
+  s_goFx.kind   = kind;
 }
 
 static void gameOverFxTick() {
@@ -527,13 +575,21 @@ static void gameOverFxTick() {
   const uint32_t now = millis();
   if ((int32_t)(now - s_goFx.nextAt) < 0) return;
 
-  // 6 steps = 3 flashes (red/off)
+  if (s_goFx.kind == GE_STOPPED) {
+    gameFinalizeToIdle();
+    return;
+  }
+
   const bool on = ((s_goFx.step % 2) == 0);
+  const bool success = (s_goFx.kind == GE_SUCCESS);
+  const uint8_t hue   = success ? 96  : 0;
+  const uint8_t value = success ? 140 : 120;
+
   for (uint8_t h = 1; h <= 6; ++h) {
     sendHouseDigital(h,
       /*flags*/0x01 | 0x02 | 0x04,
       /*win*/on ? WIN_FX_SOLID : WIN_FX_OFF,
-      /*h*/0, /*s*/255, /*v*/120, /*spd*/0,
+      /*h*/hue, /*s*/255, /*v*/value, /*spd*/0,
       /*panel*/PANEL_MODE_TEXT, "", 1, 1, 0,
       /*spk*/0, 0, false, /*stopNow*/true
     );
@@ -541,24 +597,23 @@ static void gameOverFxTick() {
 
   s_goFx.step++;
   if (s_goFx.step >= 6) {
-    // Finalize: full off and back to idle
-    housesAllOff();
-    s_goFx.active = false;
-    g_game.phase = GP_IDLE;
-    requestGameStateBurst(6);
-    DBG_PRINTLN("game: OVER -> IDLE");
-    gamePrintStatus();
+    gameFinalizeToIdle();
   } else {
     s_goFx.nextAt = now + 160;
   }
 }
 
-static void gameStop(){
-  if (g_game.phase == GP_IDLE) return;
+static void gameStop(uint8_t kind){
+  if (g_game.phase != GP_RUNNING) return;
 
   const uint32_t now = millis();
 
   g_game.phase = GP_OVER;
+  g_lastGameEndKind = kind;
+
+  #if PMS_STD_ENABLED
+  s_pmsEndReasonHint = gameEndKindToPmsReason(kind);
+  #endif
 
   // Stop engine + clear active orders
   g_engine.stopGame(now);
@@ -573,8 +628,8 @@ static void gameStop(){
   // Clear list on OrdersStation
   ordersPushWindowDripStart(/*maxDisplay*/3, /*delay*/0);
 
-  // Start game over window animation (panels stay off)
-  gameOverFxStart();
+  // Start end-of-run animation (panels stay off)
+  gameOverFxStart(kind);
 
   // Also clear remembered toppings at game end
   ingredientsResetAll();
@@ -582,7 +637,7 @@ static void gameStop(){
   // Clear delivery scan de-dupe history between runs.
   deliverDedupReset();
 
-  DBG_PRINTLN("game: STOP");
+  DBG_PRINTF("game: STOP (%s)\n", gameEndKindLabel(kind));
   gamePrintStatus();
 }
 
@@ -611,13 +666,10 @@ static void gameTick(){
 
   if (g_game.phase != GP_RUNNING) return;
 
-  // Global run cap
+  // Global run cap. Surviving the full run timer counts as SUCCESS.
   if ((int32_t)(now - g_game.endsAt) >= 0) {
-    DBG_PRINTLN("game: TIME UP");
-    #if PMS_STD_ENABLED
-    s_pmsEndReasonHint = "timeup";
-    #endif
-    gameStop();
+    DBG_PRINTLN("game: SUCCESS (timer survived)");
+    gameStop(GE_SUCCESS);
     return;
   }
 
@@ -648,11 +700,9 @@ static void gameTick(){
 
   // Engine might end the game (out of lives, completed final level)
   if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
-    DBG_PRINTLN("game: ENGINE END");
-    #if PMS_STD_ENABLED
-    s_pmsEndReasonHint = (g_engine.livesLeft() == 0) ? "no_lives" : "timeup";
-    #endif
-    gameStop();
+    const uint8_t kind = gameEndKindFromEngine();
+    DBG_PRINTF("game: ENGINE END (%s)\n", gameEndKindLabel(kind));
+    gameStop(kind);
   }
 }
 
@@ -1447,12 +1497,9 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
           ordersPushWindowDripStart(/*maxDisplay*/3, (levelChanged ? 250 : ORD_DRIP_START_DELAY_MS));
         }
 
-        // If that delivery completed the game (final level), stop cleanly
+        // If that delivery completed the game (final level), stop cleanly.
         if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
-          #if PMS_STD_ENABLED
-          s_pmsEndReasonHint = (g_engine.livesLeft() == 0) ? "no_lives" : "timeup";
-          #endif
-          gameStop();
+          gameStop(gameEndKindFromEngine());
         }
       }
 
@@ -1463,10 +1510,7 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
         ordersPushWindowDripStart(/*maxDisplay*/3, ORD_DRIP_START_DELAY_MS);
       }
       if (g_engine.phase() != PizzaGameEngine::Phase::Running) {
-        #if PMS_STD_ENABLED
-        s_pmsEndReasonHint = (g_engine.livesLeft() == 0) ? "no_lives" : "timeup";
-        #endif
-        gameStop();
+        gameStop(gameEndKindFromEngine());
       }
     }
     return;
@@ -1651,9 +1695,7 @@ static bool handlePmsLine(const String& rawLine) {
   }
 
   if (kind == "STOP") {
-    // Hint end reason for PMS (used when we detect the transition)
-    s_pmsEndReasonHint = "stopped";
-    gameStop();
+    gameStop(GE_STOPPED);
     return true;
   }
 
@@ -1728,9 +1770,16 @@ static void pmsTick() {
       const char* reason = s_pmsEndReasonHint;
       if (!reason) {
         // Best-effort fallback
-        if (curLives == 0) reason = "no_lives";
-        else if ((int32_t)(now - g_game.endsAt) >= 0) reason = "timeup";
-        else reason = "stopped";
+        switch (g_lastGameEndKind) {
+          case GE_SUCCESS: reason = "success"; break;
+          case GE_LOSS:    reason = "no_lives"; break;
+          case GE_STOPPED: reason = "stopped"; break;
+          default:
+            if (curLives == 0) reason = "no_lives";
+            else if ((int32_t)(now - g_game.endsAt) >= 0) reason = "success";
+            else reason = "stopped";
+            break;
+        }
       }
       pmsPrintEventGameEnd(reason, curScore, curLives);
       s_pmsEndReasonHint = nullptr;
@@ -2300,9 +2349,9 @@ void loop() {
     return;
   }
   #if PMS_STD_ENABLED
-  if (line == "game stop"){ s_pmsEndReasonHint = "stopped"; gameStop(); return; }
+  if (line == "game stop"){ gameStop(GE_STOPPED); return; }
 #else
-  if (line == "game stop"){ gameStop(); return; }
+  if (line == "game stop"){ gameStop(GE_STOPPED); return; }
 #endif
   if (line == "game status"){ gamePrintStatus(); return; }
   // game next  -> advance to next level (manual)
