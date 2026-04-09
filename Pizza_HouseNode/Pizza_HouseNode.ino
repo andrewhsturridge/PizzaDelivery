@@ -361,10 +361,11 @@ static uint8_t adjustedVolForClip(uint8_t clipId, uint8_t requestedVol) {
   }
 
   if (isGeneratedBeepIdentity(clipId)) {
-    // ~60% volume, clamped. At v=10 this becomes ~6.
-    uint16_t scaled = (uint16_t)v * 60 / 100;
-    if (scaled < 5)  scaled = 5;
-    if (scaled > 12) scaled = 12;
+    // Generated beep identities (100..105) were being clamped too low.
+    // Raise them, but keep a little attenuation so they stay comfortable.
+    uint16_t scaled = (uint16_t)v * 75 / 100;
+    if (scaled < 8)  scaled = 8;
+    if (scaled > 60) scaled = 60;
     v = (uint8_t)scaled;
   }
 
@@ -887,12 +888,12 @@ void loop() {
     if (g_lastOk) {
       g_fx = EFFECT_OK_PULSE; g_fxUntil = millis() + 600;
       g_fxDirty = true;
-      playResultBeep(true, 30);
+      playResultBeep(true, 60);
       PZ_LOGI("DELIVER_RESULT OK");
     } else {
       g_fx = EFFECT_ERR_PULSE; g_fxUntil = millis() + 600;
       g_fxDirty = true;
-      playResultBeep(false, 28);
+      playResultBeep(false, 56);
       PZ_LOGI("DELIVER_RESULT ERR reason=%u", pendResult.reason);
     }
   }

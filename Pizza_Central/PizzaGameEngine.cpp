@@ -188,6 +188,34 @@ static bool isDigitsOnly(const char* s) {
   return true;
 }
 
+static bool parseSimplePlusEquation(const char* s, uint16_t& outValue) {
+  outValue = 0;
+  if (!s || !*s) return false;
+
+  uint32_t a = 0, b = 0;
+  const char* p = s;
+
+  if (*p < '0' || *p > '9') return false;
+  while (*p >= '0' && *p <= '9') {
+    a = a * 10u + (uint32_t)(*p - '0');
+    ++p;
+  }
+
+  if (*p != '+') return false;
+  ++p;
+
+  if (*p < '0' || *p > '9') return false;
+  while (*p >= '0' && *p <= '9') {
+    b = b * 10u + (uint32_t)(*p - '0');
+    ++p;
+  }
+
+  if (*p != '\0') return false;
+
+  outValue = (uint16_t)(a + b);
+  return true;
+}
+
 static void shuffleU8(uint8_t* a, uint8_t n, uint32_t (*rng)()) {
   for (uint8_t i=0;i<n;i++) {
     uint8_t j = (uint8_t)(i + (rng() % (n - i)));
@@ -1248,7 +1276,12 @@ bool PizzaGameEngine::buildUniqueSingle(Domain d, uint8_t& outHouse, char* outTe
       snprintf(outText, outTextSz, "house #%s", sel.tok);
     }
     else {
-      snprintf(outText, outTextSz, "the house labeled %s", sel.tok);
+      uint16_t solved = 0;
+      if (parseSimplePlusEquation(sel.tok, solved)) {
+        snprintf(outText, outTextSz, "house %u", (unsigned)solved);
+      } else {
+        snprintf(outText, outTextSz, "the house labeled %s", sel.tok);
+      }
     }
   }
   else if (d == Domain::Window) {
@@ -1378,7 +1411,7 @@ bool PizzaGameEngine::buildUniqueCompositeAnchored(Domain anchor, uint8_t& outHo
   auto prettyTok=[&](Domain d, const char* tok, char* out, size_t outSz){
     if (!tok || !*tok) { strlcpy(out, "", outSz); return; }
     if (d == Domain::Panel) {
-      // Panel token is either digits, text, or icon token like "@STAR"
+      // Panel token is either digits, a simple equation, text, or an icon token like "@STAR"
       if (tok[0] == '@') {
         char name[24]={0};
         strlcpy(name, tok+1, sizeof(name));
@@ -1389,6 +1422,11 @@ bool PizzaGameEngine::buildUniqueCompositeAnchored(Domain anchor, uint8_t& outHo
       }
       if (isDigitsOnly(tok)) {
         snprintf(out, outSz, "#%s", tok);
+        return;
+      }
+      uint16_t solved = 0;
+      if (parseSimplePlusEquation(tok, solved)) {
+        snprintf(out, outSz, "%u", (unsigned)solved);
         return;
       }
       // normal text

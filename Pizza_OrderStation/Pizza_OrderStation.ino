@@ -50,6 +50,10 @@ static volatile bool g_osDirty = false; // request a UI refresh from loop()
 static PzOrderItemSetPayload OS_orders[3];       // 0..2
 static uint32_t              OS_recvMs[3] = {0}; // when ITEM_SET last received per slot
 static uint16_t              OS_totalS[3] = {0}; // estimated total seconds per slot (for ring)
+static constexpr uint8_t    OS_TOTAL_CACHE_SLOTS = 12;
+static uint16_t              OS_totalCacheId[OS_TOTAL_CACHE_SLOTS] = {0};
+static uint16_t              OS_totalCacheS[OS_TOTAL_CACHE_SLOTS] = {0};
+static uint32_t              OS_totalCacheSeenMs[OS_TOTAL_CACHE_SLOTS] = {0};
 static uint8_t               OS_count    = 0;    // 0..3
 static uint8_t               OS_index    = 0;    // 0..OS_count-1
 static bool                  OS_loading  = false;
@@ -139,6 +143,55 @@ static uint16_t OS_remainS(uint8_t slot) {
   return (uint16_t)(base - elapsedS);
 }
 
+static void OS_totalCacheClear() {
+  for (uint8_t i = 0; i < OS_TOTAL_CACHE_SLOTS; ++i) {
+    OS_totalCacheId[i] = 0;
+    OS_totalCacheS[i] = 0;
+    OS_totalCacheSeenMs[i] = 0;
+  }
+}
+
+static uint16_t OS_totalCacheLookup(uint16_t orderId) {
+  if (orderId == 0) return 0;
+  for (uint8_t i = 0; i < OS_TOTAL_CACHE_SLOTS; ++i) {
+    if (OS_totalCacheId[i] == orderId) {
+      OS_totalCacheSeenMs[i] = millis();
+      return OS_totalCacheS[i];
+    }
+  }
+  return 0;
+}
+
+static void OS_totalCacheStore(uint16_t orderId, uint16_t totalS) {
+  if (orderId == 0 || totalS == 0) return;
+
+  uint8_t best = 0xFF;
+
+  for (uint8_t i = 0; i < OS_TOTAL_CACHE_SLOTS; ++i) {
+    if (OS_totalCacheId[i] == orderId) {
+      OS_totalCacheS[i] = totalS;
+      OS_totalCacheSeenMs[i] = millis();
+      return;
+    }
+    if (best == 0xFF && OS_totalCacheId[i] == 0) best = i;
+  }
+
+  if (best == 0xFF) {
+    uint32_t oldestSeen = OS_totalCacheSeenMs[0];
+    best = 0;
+    for (uint8_t i = 1; i < OS_TOTAL_CACHE_SLOTS; ++i) {
+      if (OS_totalCacheSeenMs[i] < oldestSeen) {
+        oldestSeen = OS_totalCacheSeenMs[i];
+        best = i;
+      }
+    }
+  }
+
+  OS_totalCacheId[best] = orderId;
+  OS_totalCacheS[best] = totalS;
+  OS_totalCacheSeenMs[best] = millis();
+}
+
 // Build the display string for a slot (NO timer prefix — ring shows time)
 static bool OS_buildDisplayForSlot(uint8_t slot, char* out, size_t outSz) {
   if (!out || outSz == 0) return false;
@@ -174,8 +227,10 @@ static bool OS_buildDisplayForSlot(uint8_t slot, char* out, size_t outSz) {
 
 // Render countdown for the currently selected order on the NeoPixel ring.
 // Simple behavior:
-// - One shrinking ring (green) while >10s remain
-// - Last 10s: red + simple blink (single rate, no "restart")
+// - One continuously shrinking ring
+// - Green while >10s remain
+// - Red in the last 10s
+// No blink / restart behavior.
 static void OS_tickRing() {
   if (otaActive) return; // OTA owns the ring
 
@@ -230,13 +285,10 @@ static void OS_tickRing() {
   if (rem > 0 && lit == 0) lit = 1;
   if (lit > NEOPIXEL_COUNT) lit = NEOPIXEL_COUNT;
 
-  // Color/urgency
-  uint32_t col = neopixelRing.Color(0, 40, 0); // green
-  if (rem <= 10) {
-    // Simple blink at a single rate (~1.4 Hz)
-    bool on = (((now / 350) & 1) == 0);
-    col = on ? neopixelRing.Color(60, 0, 0) : 0;
-  }
+  // Color/urgency: keep the timer visually continuous all the way down.
+  uint32_t col = (rem <= 10)
+               ? neopixelRing.Color(60, 0, 0)   // red
+               : neopixelRing.Color(0, 40, 0);  // green
 
   for (uint16_t i = 0; i < NEOPIXEL_COUNT; i++) {
     neopixelRing.setPixelColor(i, (i < lit) ? col : 0);
@@ -439,19 +491,19 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     tmp.remain_s = remainS;
 
     if (tmp.index < 3) {
-      uint16_t prevId = 0;
       portENTER_CRITICAL(&g_osMux);
-      prevId = OS_orders[tmp.index].order_id;
       OS_orders[tmp.index] = tmp;
       OS_recvMs[tmp.index] = millis();
 
       // Track a stable "total" time per order_id for ring progress.
-      // We seed it ONCE when a new order_id appears and then keep it fixed
-      // so the ring never "restarts" mid-countdown.
-      if (tmp.remain_s > 0) {
-        if (tmp.order_id != prevId || OS_totalS[tmp.index] == 0) {
-          OS_totalS[tmp.index] = tmp.remain_s;
-        }
+      // Central drip-resends RESET + ITEM_SET, so slot-local state is not enough:
+      // preserve the first-seen total for each order_id across resets so the
+      // timer never appears to refill or restart mid-order.
+      if (tmp.remain_s > 0 && tmp.order_id != 0) {
+        uint16_t totalS = OS_totalCacheLookup(tmp.order_id);
+        if (totalS == 0) totalS = tmp.remain_s;
+        OS_totalS[tmp.index] = totalS;
+        OS_totalCacheStore(tmp.order_id, totalS);
       } else {
         OS_totalS[tmp.index] = 0;
       }
@@ -521,6 +573,7 @@ void setup() {
 
   neoRingInit();
   PizzaOta::setProgressCallback(neoRingProgressDirectCB);
+  OS_totalCacheClear();
 
   showNoOrders(true);
   sendHello();
@@ -565,6 +618,7 @@ void loop() {
     if (newPhase != 1) {
       // Game idle/over: clear local state and keep all player-facing outputs quiet.
       portENTER_CRITICAL(&g_osMux);
+      OS_totalCacheClear();
       OS_count = 0;
       OS_index = 0;
       OS_loading = false;
@@ -587,6 +641,10 @@ void loop() {
       digitalWrite(LAMP_PIN, HIGH); // lamp off (active-low)
       neoRingClear();
     } else {
+      // New run: clear any totals cached from a prior game before order_id values restart.
+      portENTER_CRITICAL(&g_osMux);
+      OS_totalCacheClear();
+      portEXIT_CRITICAL(&g_osMux);
       // Game resumed; force a redraw on next loop.
       g_osDirty = true;
     }
