@@ -201,9 +201,12 @@ static uint8_t g_besideB[7] = {0, 0, 3, 0, 0, 4, 0}; // second neighbor (if any)
 static uint8_t g_across[7] = {0, 6, 5, 4, 3, 2, 1};
 
 // Box whitelist
+// Increased from 6 to 13 so you can keep the original 6 boxes and add 7 more.
+#define PZ_BOXES_MAX 13
+
 struct BoxUID { uint8_t len; uint8_t uid[10]; bool set; };
-static BoxUID g_box[6];
-static int8_t g_learnSlot = 0;  // 1..6 means “capture next scan into this slot”
+static BoxUID g_box[PZ_BOXES_MAX];
+static int8_t g_learnSlot = 0;  // 1..PZ_BOXES_MAX means “capture next scan into this slot”
 
 ///// Game Manager (state + config) /////
 enum GamePhase : uint8_t { GP_IDLE=0, GP_RUNNING=1, GP_OVER=2 };
@@ -997,13 +1000,13 @@ static bool uidEq(const uint8_t* a, uint8_t alen, const uint8_t* b, uint8_t blen
 }
 
 static bool isWhitelisted(const uint8_t* uid, uint8_t len){
-  for (int i=0;i<6;i++) if (g_box[i].set && uidEq(uid, len, g_box[i].uid, g_box[i].len)) return true;
+  for (int i=0;i<PZ_BOXES_MAX;i++) if (g_box[i].set && uidEq(uid, len, g_box[i].uid, g_box[i].len)) return true;
   return false;
 }
 
 static void boxesShow(){
   DBG_PRINTLN("boxes:");
-  for (int i=0;i<6;i++){
+  for (int i=0;i<PZ_BOXES_MAX;i++){
     DBG_PRINTF("  %d: ", i+1);
     if (!g_box[i].set) { DBG_PRINTLN("(empty)"); continue; }
     for (uint8_t k=0;k<g_box[i].len;k++){ if (g_box[i].uid[k]<16) DBG_PRINT('0'); DBG_PRINT(g_box[i].uid[k], HEX); if (k+1<g_box[i].len) DBG_PRINT(':'); }
@@ -1011,9 +1014,9 @@ static void boxesShow(){
   }
 }
 
-static void boxesClear(int idx /*1..6 or 0 for all*/){
-  if (idx==0){ for (int i=0;i<6;i++){ g_box[i].set=false; g_box[i].len=0; } }
-  else if (idx>=1 && idx<=6){ g_box[idx-1].set=false; g_box[idx-1].len=0; }
+static void boxesClear(int idx /*1..PZ_BOXES_MAX or 0 for all*/){
+  if (idx==0){ for (int i=0;i<PZ_BOXES_MAX;i++){ g_box[i].set=false; g_box[i].len=0; } }
+  else if (idx>=1 && idx<=PZ_BOXES_MAX){ g_box[idx-1].set=false; g_box[idx-1].len=0; }
 }
 
 static bool parseUidHex(const String& s, uint8_t out[10], uint8_t &len){
@@ -1035,8 +1038,8 @@ struct BoxStore {
 };
 
 static void boxesSave(){
-  BoxStore a[6] = {};
-  for (int i=0;i<6;i++){
+  BoxStore a[PZ_BOXES_MAX] = {};
+  for (int i=0;i<PZ_BOXES_MAX;i++){
     a[i].len = g_box[i].len;
     a[i].set = g_box[i].set ? 1 : 0;
     memset(a[i].uid, 0, sizeof(a[i].uid));
@@ -1051,22 +1054,34 @@ static void boxesSave(){
 }
 
 static void boxesLoad(){
-  BoxStore a[6] = {};
+  BoxStore a[PZ_BOXES_MAX] = {};
   s_prefsBoxes.begin("central", true);
   size_t got = s_prefsBoxes.getBytes("boxes", a, sizeof(a));
   s_prefsBoxes.end();
 
-  if (got == sizeof(a)) {
-    for (int i=0;i<6;i++){
+  // Backward-compatible load:
+  // - old code saved 6 BoxStore records
+  // - new code saves PZ_BOXES_MAX BoxStore records
+  // This keeps your original 6 boxes instead of wiping them when upgrading to 13.
+  const size_t one = sizeof(BoxStore);
+  int count = 0;
+  if (got > 0 && (got % one) == 0) count = (int)(got / one);
+  if (count > PZ_BOXES_MAX) count = PZ_BOXES_MAX;
+
+  for (int i=0;i<PZ_BOXES_MAX;i++){ g_box[i].set=false; g_box[i].len=0; }
+
+  if (count > 0) {
+    for (int i=0;i<count;i++){
       g_box[i].len = a[i].len;
       g_box[i].set = (a[i].set != 0);
       if (g_box[i].len > 10) g_box[i].len = 0;
       if (g_box[i].len) memcpy(g_box[i].uid, a[i].uid, g_box[i].len);
     }
-    DBG_PRINTLN("boxes: loaded from NVS");
+    DBG_PRINTF("boxes: loaded %d slot(s) from NVS\n", count);
+
+    // If we loaded the old 6-slot format, immediately upgrade/save as 13-slot format.
+    if (got != sizeof(a)) boxesSave();
   } else {
-    // Nothing stored yet → leave empty
-    for (int i=0;i<6;i++){ g_box[i].set=false; g_box[i].len=0; }
     DBG_PRINTLN("boxes: NVS empty");
   }
 }
@@ -1401,7 +1416,7 @@ static void onRx(const MsgHeader& hdr, const uint8_t* payload, uint16_t len, con
     const DeliverScanPayload* s = (const DeliverScanPayload*)payload;
 
     // Optional learn mode (you kept this — good)
-    if (g_learnSlot >= 1 && g_learnSlot <= 6) {
+    if (g_learnSlot >= 1 && g_learnSlot <= PZ_BOXES_MAX) {
       g_box[g_learnSlot-1].len = s->uid_len;
       memcpy(g_box[g_learnSlot-1].uid, s->uid, s->uid_len);
       g_box[g_learnSlot-1].set = true;
@@ -1835,8 +1850,8 @@ static void printHelp() {
 
   // Boxes (pizza box UID management)
   DBG_PRINTLN(F("Boxes (pizza box UID management)"));
-  DBG_PRINTLN(F("  boxes show                     Show current 1..6 box UID slots"));
-  DBG_PRINTLN(F("  boxes clear [n]                Clear all or slot n (1..6)"));
+  DBG_PRINTLN(F("  boxes show                     Show current 1..13 box UID slots"));
+  DBG_PRINTLN(F("  boxes clear [n]                Clear all or slot n (1..13)"));
   DBG_PRINTLN(F("  boxes set <n> <UIDhex>         Set slot n with UID (colons ok)"));
   DBG_PRINTLN(F("  boxes learn <n>                Learn next scanned tag into slot n"));
   DBG_PRINTLN(F("  boxes reload                   Reload from NVS and show"));
@@ -2294,7 +2309,7 @@ void loop() {
   if (line == "boxes show"){ boxesShow(); return; }
 
   // boxes clear            -> clear all
-  // boxes clear <n>        -> clear one slot (1..6)
+  // boxes clear <n>        -> clear one slot (1..PZ_BOXES_MAX)
   if (line.startsWith("boxes clear")){
     String rest = line.substring(11); rest.trim();
     int slot = rest.length()? rest.toInt() : 0;
@@ -2308,10 +2323,10 @@ void loop() {
   if (line.startsWith("boxes set ")){
     String rest = line.substring(10); rest.trim();
     int sp = rest.indexOf(' ');
-    if (sp<0){ DBG_PRINTLN("usage: boxes set <1..6> <UIDhex>"); return; }
+    if (sp<0){ DBG_PRINTLN("usage: boxes set <1..13> <UIDhex>"); return; }
     int slot = rest.substring(0,sp).toInt();
     String hex = rest.substring(sp+1); hex.trim();
-    if (slot<1||slot>6){ DBG_PRINTLN("usage: boxes set <1..6> <UIDhex>"); return; }
+    if (slot<1||slot>PZ_BOXES_MAX){ DBG_PRINTLN("usage: boxes set <1..13> <UIDhex>"); return; }
     uint8_t buf[10], len=0;
     if (!parseUidHex(hex, buf, len)){ DBG_PRINTLN("boxes set: bad UID"); return; }
     g_box[slot-1].set=true; g_box[slot-1].len=len; memcpy(g_box[slot-1].uid, buf, len);
@@ -2323,7 +2338,7 @@ void loop() {
   // boxes learn <n>   -> next scanned tag will populate slot n
   if (line.startsWith("boxes learn ")){
     int slot = line.substring(12).toInt();
-    if (slot<1||slot>6){ DBG_PRINTLN("usage: boxes learn <1..6>"); return; }
+    if (slot<1||slot>PZ_BOXES_MAX){ DBG_PRINTLN("usage: boxes learn <1..13>"); return; }
     g_learnSlot = slot;
     DBG_PRINTF("boxes: learning slot %d (scan a pizza box tag once)\n", slot);
     return;
